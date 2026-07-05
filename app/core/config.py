@@ -1,9 +1,6 @@
-"""Application settings module."""
-
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 class Settings(BaseSettings):
     """Application runtime settings.
@@ -21,6 +18,12 @@ class Settings(BaseSettings):
     environment: str = "local"
     debug: bool = False
     api_v1_prefix: str = "/api/v1"
+    secret_key: str
+    jwt_algorithm: str
+    database_url: str 
+    jwt_expiration_minutes: int 
+    max_requests: int
+    window_seconds: int
 
     model_config = SettingsConfigDict(
         env_file=".env",
