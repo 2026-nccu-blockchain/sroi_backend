@@ -1,0 +1,8 @@
+Alembic 遷移腳本目錄
+
+常用命令:
+  alembic revision --autogenerate -m "描述"  # 生成遷移腳本
+  alembic upgrade head                       # 執行遷移
+  alembic downgrade -1                       # 回滾一步
+  alembic current                            # 查看當前版本
+  alembic history                            # 查看遷移歷史
