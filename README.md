@@ -25,7 +25,7 @@ pip install -r requirements.txt
 ### 4) Setup env file
 
 ```bash
-cp app/.env.example app/.env
+cp .env.example .env
 ```
 
 ## Before Run
