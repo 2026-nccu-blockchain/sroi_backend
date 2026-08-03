@@ -7,3 +7,7 @@ pydantic-settings
 email-validator
 PyJWT
 pytz
+bcrypt
+alembic
+psycopg2
+psycopg2-binary
