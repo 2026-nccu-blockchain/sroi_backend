@@ -38,6 +38,12 @@ class User(Base):
         return bcrypt.checkpw(plain_password.encode('utf-8'), self.hash_password.encode('utf-8'))
 
 
+class Result(Base):
+    __tablename__ = "results"
+
+    result_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    content = Column(String(255), nullable=False)
+
 class Form(Base):
     __tablename__ = "forms"
 
@@ -45,14 +51,30 @@ class Form(Base):
     author_id = Column(String(36), ForeignKey("users.id"), nullable=False)
     title = Column(String(255))
     content = Column(String(255))
+    result_id_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     author = relationship("User", back_populates="forms")
+    pages = relationship("Page", back_populates="form")
     questions = relationship("Question", back_populates="form")
     answers = relationship("Answer", back_populates="form")
 
+
+class Page(Base):
+    __tablename__ = "pages"
+
+    page_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    form_id = Column(String(36), ForeignKey("forms.form_id"), nullable=False)
+    title = Column(String(255))
+    content = Column(Text, nullable=False)
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    form = relationship("Form", back_populates="pages")
+    questions = relationship("Question", back_populates="page")
 
 class Question(Base):
     __tablename__ = "questions"
@@ -60,16 +82,23 @@ class Question(Base):
     question_id = Column(String(36), primary_key=True, index=True, nullable=False)
     question_type = Column(SQLEnum(QuestionType), nullable=False)
     form_id = Column(String(36), ForeignKey("forms.form_id"), nullable=False)
+    page_id = Column(String(36), ForeignKey("pages.page_id"), nullable=False)
+    result_id = Column(String(36))
     title = Column(String(255))
     content = Column(Text, nullable=False)
-    display_order = Column(Integer, nullable=False)
+    scale_begin = Column(Integer)
+    scale_end = Column(Integer)
     options = Column(ARRAY(String(255)))
     is_multiple = Column(Boolean, nullable=False, default=False)
+    pre_id = Column(String(36))
+    next_id = Column(String(36))
+    is_temp = Column(Boolean, nullable=False, default=False)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     form = relationship("Form", back_populates="questions")
+    page = relationship("Page", back_populates="questions")
     answers = relationship("Answer", back_populates="question")
 
 
@@ -78,6 +107,7 @@ class Answer(Base):
 
     answer_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     form_id = Column(String(36), ForeignKey("forms.form_id"), nullable=False)
+    page_id = Column(String(36), ForeignKey("pages.page_id"), nullable=False)
     question_id = Column(String(36), ForeignKey("questions.question_id"), nullable=False)
     content = Column(Text)
     email = Column(String(255), nullable=False)
