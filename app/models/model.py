@@ -6,6 +6,7 @@ from app.db.base import Base
 from enum import Enum
 import uuid
 import bcrypt
+import re
 
 
 class Role(Enum):
@@ -27,8 +28,8 @@ class QuestionType(Enum):
 class Account(Base):
     __tablename__ = "accounts"
 
-    id = Column(String(36), primary_key=True, index=True, nullable=False) # 教職員編號、學號
-    uuid = Column(String(36), index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    id = Column(String(36)) # 教職員編號、學號
+    uuid = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), nullable=False)
     hash_password = Column(String(255), nullable=False)
     name = Column(String(20), nullable=False)
@@ -46,6 +47,11 @@ class Account(Base):
 
     def verify_password(self, plain_password: str) -> bool:
         return bcrypt.checkpw(plain_password.encode('utf-8'), self.hash_password.encode('utf-8'))
+
+    @staticmethod
+    def verify_email(email: str) -> bool:
+        email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        return re.match(email_regex, email) is not None
 
     
 class Group(Base):
@@ -81,7 +87,7 @@ class Form(Base):
     __tablename__ = "forms"
 
     form_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    author_id = Column(String(36), ForeignKey("accounts.id"), nullable=False)
+    author_id = Column(String(36), ForeignKey("accounts.uuid"), nullable=False)
     title = Column(String(255))
     content = Column(String(255))
     result_id_list = Column(ARRAY(String(255)))
