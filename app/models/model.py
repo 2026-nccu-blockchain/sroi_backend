@@ -8,6 +8,14 @@ import uuid
 import bcrypt
 
 
+class Role(Enum):
+    ADMIN = "admin"
+    DB_EDITOR = "db_editor"
+    NORMAL = "normal"
+    NON_AUTH = "non_auth"
+    LEADER = "leader"
+    MEMBER = "member"
+
 class QuestionType(Enum):
     OQ = "OQ"
     CQ = "CQ"
@@ -16,19 +24,21 @@ class QuestionType(Enum):
     DS = "DS"
 
 
-class User(Base):
-    __tablename__ = "users"
+class Account(Base):
+    __tablename__ = "accounts"
 
     id = Column(String(36), primary_key=True, index=True, nullable=False) # 教職員編號、學號
+    uuid = Column(String(36), index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), nullable=False)
     hash_password = Column(String(255), nullable=False)
     name = Column(String(20), nullable=False)
-    role = Column(String(20), nullable=False)
+    role = Column(SQLEnum(Role), nullable=False)
+    group_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
-    forms = relationship("Form", back_populates="author")
+    # forms = relationship("Form", back_populates="author")
 
     def set_password(self, password: str) -> None:
         salt = bcrypt.gensalt()
@@ -36,6 +46,29 @@ class User(Base):
 
     def verify_password(self, plain_password: str) -> bool:
         return bcrypt.checkpw(plain_password.encode('utf-8'), self.hash_password.encode('utf-8'))
+
+    
+class Group(Base):
+    __tablename__ = "groups"
+
+    group_id  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    title = Column(String(255), nullable=False)
+    desc = Column(Text, nullable=False)
+    begin = Column(DateTime(timezone=True), nullable=False)
+    end = Column(DateTime(timezone=True), nullable=False)
+    leader_list = Column(ARRAY(String(255)))
+    member_list = Column(ARRAY(String(255)))
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+
+class GroupAccount(Base):
+    __tablename__ = "group_account"
+
+    group_id = Column(String(36), primary_key=True, nullable=False)
+    account_id = Column(String(36), primary_key=True, nullable=False)
+    group_role = Column(SQLEnum(Role), nullable=False)
 
 
 class Result(Base):
@@ -48,7 +81,7 @@ class Form(Base):
     __tablename__ = "forms"
 
     form_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    author_id = Column(String(36), ForeignKey("users.id"), nullable=False)
+    author_id = Column(String(36), ForeignKey("accounts.id"), nullable=False)
     title = Column(String(255))
     content = Column(String(255))
     result_id_list = Column(ARRAY(String(255)))
@@ -56,7 +89,7 @@ class Form(Base):
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
-    author = relationship("User", back_populates="forms")
+    # author = relationship("User", back_populates="forms")
     pages = relationship("Page", back_populates="form")
     questions = relationship("Question", back_populates="form")
     answers = relationship("Answer", back_populates="form")

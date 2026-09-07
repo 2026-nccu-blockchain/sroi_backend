@@ -38,6 +38,16 @@ please check env is already rewriten
 uvicorn app.main:app --reload
 ```
 
+## Alembic
+
+```bash
+alembic revision --autogenerate -m "描述"  # 生成遷移腳本
+alembic upgrade head                       # 執行遷移
+alembic downgrade -1                       # 回滾一步
+alembic current                            # 查看當前版本
+alembic history                            # 查看遷移歷史
+```
+
 ## Cloudinary api
 We use [Cloudinary](https://cloudinary.com/) api to upload image and change it to url.  
 You need a Cloudinary account to complete .env.
