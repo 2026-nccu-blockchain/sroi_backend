@@ -12,8 +12,9 @@ import re
 class Role(Enum):
     ADMIN = "admin"
     DB_EDITOR = "db_editor"
-    NORMAL = "normal"
-    NON_AUTH = "non_auth"
+    VERIFIED = "verified"
+    IN_PROGRESS = "in_progress"
+    UNVERIFIED = "unverified"
     LEADER = "leader"
     MEMBER = "member"
 
@@ -28,12 +29,13 @@ class QuestionType(Enum):
 class Account(Base):
     __tablename__ = "accounts"
 
-    id = Column(String(36)) # 教職員編號、學號
-    uuid = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    campus_id = Column(String(36)) # 教職員編號、學號
+    user_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), nullable=False)
     hash_password = Column(String(255), nullable=False)
     name = Column(String(20), nullable=False)
     role = Column(SQLEnum(Role), nullable=False)
+    id_card_link = Column(String(255))
     group_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -62,6 +64,7 @@ class Group(Base):
     desc = Column(Text, nullable=False)
     begin = Column(DateTime(timezone=True), nullable=False)
     end = Column(DateTime(timezone=True), nullable=False)
+    status = Column(SQLEnum(Role), nullable=False)
     leader_list = Column(ARRAY(String(255)))
     member_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
@@ -87,7 +90,7 @@ class Form(Base):
     __tablename__ = "forms"
 
     form_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    author_id = Column(String(36), ForeignKey("accounts.uuid"), nullable=False)
+    author_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False)
     title = Column(String(255))
     content = Column(String(255))
     result_id_list = Column(ARRAY(String(255)))

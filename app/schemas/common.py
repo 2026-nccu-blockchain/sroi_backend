@@ -10,6 +10,7 @@ class APIResponse(BaseModel):
     response_datetime: datetime
     # 不加 data 欄位，或直接把要回傳的欄位寫在這層
     # 其他欄位依需求加
+    token: Optional[str] = None
     
 
 # 錯誤回應的格式 

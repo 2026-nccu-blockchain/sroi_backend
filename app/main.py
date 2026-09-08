@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +9,6 @@ from app.core.exceptions import APIException
 from app.schemas.common import ErrorResponse
 from app.core.middleware import CustomHeaderMiddleware, RateLimitMiddleware
 from app.api.v1.router import api_router
-import pytz
 
 
 settings = get_settings()
@@ -42,8 +41,8 @@ async def api_exception_handler(request: Request, exc: APIException):
         status_code=exc.status_code,
           content=jsonable_encoder(ErrorResponse(
             status_code=exc.status_code_str,
-            desc=exc.desc,
-            response_datetime=datetime.now(pytz.timezone('Asia/Taipei'))
+            message=exc.message,
+            response_datetime=datetime.now()
           ))
     )
 
