@@ -33,10 +33,10 @@ def user_login(data: LoginRequest, db: Session = Depends(get_db)) -> dict:
         raise APIException(400, "10007", "incorrect email format")
     user = db.query(Account).filter(Account.email == data.email and Account.is_delete == False).first()
     if user is None:
-        raise APIException(400, "10001", "user not found")
+        raise APIException(404, "10001", "user not found")
     if not user.verify_password(data.password):
         raise APIException(400, "10002", "invalid password")
-    payload = {"id": f"{user.uuid}", "role": f"{user.role.value}"}
+    payload = {"user_id": f"{user.user_id}", "role": f"{user.role.value}"}
     token = create_access_token(payload)
     
     return APIResponse(
@@ -59,7 +59,7 @@ def user_register(data: RegisterRequest, db: Session = Depends(get_db)) -> dict:
         email=data.email,
         hash_password=" ", #不能是null，下面才會設密碼,
         name=data.name,
-        role=Role.NON_AUTH
+        role=Role.UNVERIFIED
     )
     new_account.set_password(data.password)
     db.add(new_account)
