@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, Depends
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models.model import Role, Account, VerifiedInProgress
+from app.models.model import Role, Account, VerifiedInProgress, Group, GroupAccount
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
@@ -98,6 +98,50 @@ def unconfirm_change(request: Request, UserId: str, db: Session = Depends(get_db
     if verification is None:
         raise APIException(404, "10001", "user not found")
     verification.is_delete = True
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/confirm_group/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def confirm_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    if payload["role"] != Role.ADMIN.value:
+        raise APIException(400, "10008", "permission denied")
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.IN_PROGRESS, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    group.status = Role.VERIFIED
+    new_GA = GroupAccount(
+        group_id=group.group_id,
+        user_id=group.leader_list[0],
+        group_role=Role.LEADER
+    )
+    db.add(new_GA)
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/unconfirm_group/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def unconfirm_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    if payload["role"] != Role.ADMIN.value:
+        raise APIException(400, "10008", "permission denied")
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.IN_PROGRESS, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    group.status = Role.UNVERIFIED
     db.commit()
 
     return APIResponse(

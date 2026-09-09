@@ -5,3 +5,9 @@ from typing import Optional
 class VerificationRequest(BaseModel):
     campus_id: str
     id_card_link: str
+
+class AddGroupRequest(BaseModel):
+    title: str
+    desc: str
+    begin: datetime
+    end: datetime

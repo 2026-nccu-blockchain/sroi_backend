@@ -1,13 +1,14 @@
 from fastapi import APIRouter, Request, Depends
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models.model import Role, Account, VerifiedInProgress
+from app.models.model import Role, Account, VerifiedInProgress, Group
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
 from app.schemas.user import (
     VerificationRequest,
+    AddGroupRequest
 )
 import re
 
@@ -65,6 +66,40 @@ def change_campus_id(request: Request, data: VerificationRequest, db: Session = 
     db.add(new_ver)
     db.commit()
     # 這邊要寄信
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/add_group", response_model=APIResponse, response_model_exclude_none=True)
+def add_group(request: Request, data: AddGroupRequest, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    if user.role == Role.UNVERIFIED.value or user.role == Role.IN_PROGRESS.value:
+        raise APIException(400, "10008", "permission denied")
+    new_group = Group(
+        title=data.title,
+        desc=data.desc,
+        begin=data.begin,
+        end=data.end,
+        status=Role.IN_PROGRESS,
+        leader_list=[f"{user_id}"]
+    )
+    db.add(new_group)
+    db.commit()
+    db.refresh(new_group)
+    if not user.group_list:
+        user.group_list = [f"{new_group.group_id}"]
+    else:
+        user.group_list = user.group_list + [f"{new_group.group_id}"]
+    db.commit()
 
     return APIResponse(
         status_code="00000",

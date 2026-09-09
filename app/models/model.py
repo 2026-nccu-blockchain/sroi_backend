@@ -90,7 +90,7 @@ class GroupAccount(Base):
 
     uuid  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     group_id = Column(String(36), nullable=False)
-    account_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), nullable=False)
     group_role = Column(SQLEnum(Role), nullable=False)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
