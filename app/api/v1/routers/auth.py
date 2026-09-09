@@ -31,7 +31,7 @@ def is_strong_password(password: str) -> bool:
 def user_login(data: LoginRequest, db: Session = Depends(get_db)) -> dict:
     if not Account.verify_email(data.email):
         raise APIException(400, "10007", "incorrect email format")
-    user = db.query(Account).filter(Account.email == data.email and Account.is_delete == False).first()
+    user = db.query(Account).filter(Account.email == data.email, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
     if not user.verify_password(data.password):
@@ -53,7 +53,7 @@ def user_register(data: RegisterRequest, db: Session = Depends(get_db)) -> dict:
         raise APIException(400, "10007", "incorrect email format")
     if not is_strong_password(data.password):
         raise APIException(400, "10010", "password is not strong")
-    if db.query(Account).filter(Account.email == data.email and Account.is_delete == False).first() is not None:
+    if db.query(Account).filter(Account.email == data.email, Account.is_delete == False).first() is not None:
         raise APIException(400, "10006", "register duplicate")
     new_account = Account(
         email=data.email,

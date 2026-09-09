@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, Depends
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models.model import Role, Account
+from app.models.model import Role, Account, VerifiedInProgress
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
@@ -14,17 +14,91 @@ router = APIRouter()
 
 
 @router.post("/confirm_verification/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
-def admin_confirm_verification(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+def confirm_verification(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
     if payload["role"] != Role.ADMIN.value:
         raise APIException(400, "10008", "permission denied")
-    user = db.query(Account).filter(Account.user_id == UserId and Account.is_delete == False).first()
-    if user is None and user.role.value != Role.IN_PROGRESS.value:
+    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    if user is None or user.role != Role.IN_PROGRESS:
+        raise APIException(404, "10001", "user not found")
+    verification = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == True, VerifiedInProgress.is_delete == False).first()
+    if verification is None:
         raise APIException(404, "10001", "user not found")
     user.role = Role.VERIFIED
+    user.campus_id = verification.campus_id
+    user.id_card_link = verification.id_card_link
+    verification.is_delete = True
     db.commit()
-    db.refresh(user)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/unconfirm_verification/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def unconfirm_verification(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    if payload["role"] != Role.ADMIN.value:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    if user is None or user.role != Role.IN_PROGRESS:
+        raise APIException(404, "10001", "user not found")
+    verification = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == True, VerifiedInProgress.is_delete == False).first()
+    if verification is None:
+        raise APIException(404, "10001", "user not found")
+    user.role = Role.UNVERIFIED
+    verification.is_delete = True
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/confirm_change/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def confirm_change(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    if payload["role"] != Role.ADMIN.value:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    if user is None or user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
+        raise APIException(404, "10001", "user not found")
+    verification = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == False, VerifiedInProgress.is_delete == False).first()
+    if verification is None:
+        raise APIException(404, "10001", "user not found")
+    user.campus_id = verification.campus_id
+    user.id_card_link = verification.id_card_link
+    verification.is_delete = True
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/unconfirm_change/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def unconfirm_change(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    if payload["role"] != Role.ADMIN.value:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    if user is None or user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
+        raise APIException(404, "10001", "user not found")
+    verification = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == False, VerifiedInProgress.is_delete == False).first()
+    if verification is None:
+        raise APIException(404, "10001", "user not found")
+    verification.is_delete = True
+    db.commit()
 
     return APIResponse(
         status_code="00000",

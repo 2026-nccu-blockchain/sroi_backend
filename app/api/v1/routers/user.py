@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, Depends
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models.model import Role, Account
+from app.models.model import Role, Account, VerifiedInProgress
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
@@ -15,22 +15,26 @@ router = APIRouter()
 
 
 @router.post("/request_verification", response_model=APIResponse, response_model_exclude_none=True)
-def user_request_verification(request: Request, data: VerificationRequest, db: Session = Depends(get_db)) -> dict:
+def request_verification(request: Request, data: VerificationRequest, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    if db.query(Account).filter(Account.campus_id == data.campus_id and Account.role == Role.VERIFIED and Account.is_delete == False).first() is not None:
+    if db.query(Account).filter(Account.campus_id == data.campus_id, Account.role == Role.VERIFIED, Account.is_delete == False).first() is not None:
         raise APIException(400, "10011", "already verified")
-    user = db.query(Account).filter(Account.user_id == user_id and Account.is_delete == False).first()
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
     if user.role != Role.UNVERIFIED:
         raise APIException(400, "10011", "already verified")
+    new_ver = VerifiedInProgress(
+        campus_id=data.campus_id,
+        user_id=user_id,
+        id_card_link=data.id_card_link,
+        is_ver=True
+    )
     user.role = Role.IN_PROGRESS
-    user.campus_id = data.campus_id
-    user.id_card_link = data.id_card_link
+    db.add(new_ver)
     db.commit()
-    db.refresh(user)
     # 這邊要寄信
 
     return APIResponse(
@@ -40,3 +44,30 @@ def user_request_verification(request: Request, data: VerificationRequest, db: S
     )
 
 
+@router.post("/change_campus_id", response_model=APIResponse, response_model_exclude_none=True)
+def change_campus_id(request: Request, data: VerificationRequest, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    if db.query(Account).filter(Account.campus_id == data.campus_id, Account.role != Role.UNVERIFIED, Account.Role != Role.IN_PROGRESS, Account.is_delete == False).first() is not None:
+        raise APIException(400, "10012", "the same campus id")
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    if user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
+        raise APIException(400, "10008", "permission denied")
+    new_ver = VerifiedInProgress(
+        campus_id=data.campus_id,
+        user_id=user_id,
+        id_card_link=data.id_card_link,
+        is_ver=False
+    )
+    db.add(new_ver)
+    db.commit()
+    # 這邊要寄信
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
