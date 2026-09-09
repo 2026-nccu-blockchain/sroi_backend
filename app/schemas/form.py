@@ -1,3 +1,11 @@
 from pydantic import BaseModel
-from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+
+
+class AnswerItem(BaseModel):
+    question_id: str
+    content: Optional[str] = None
+
+
+class FormAnswerRequest(BaseModel):
+    answers: List[AnswerItem]
