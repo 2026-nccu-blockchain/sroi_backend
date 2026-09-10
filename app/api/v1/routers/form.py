@@ -541,6 +541,7 @@ def submit_form_answers(
             "invalid token payload"
         )
 
+    # 確認登入使用者存在
     account = (
         db.query(Account)
         .filter(
@@ -557,7 +558,7 @@ def submit_form_answers(
             "account not found"
         )
 
-    # 確認表單存在
+    # 確認表單存在，而且尚未被刪除
     form = (
         db.query(Form)
         .filter(
@@ -651,11 +652,13 @@ def submit_form_answers(
             500,
             "50001",
             "failed to submit form answers"
+            "50002",
+            "failed to delete form"
         )
 
     return {
         "status_code": "20000",
-        "message": "form answered successfully",
+        "message": "form deleted successfully",
         "response_datetime": datetime.now(),
         "form_id": form_id
     }
