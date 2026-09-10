@@ -1,7 +1,7 @@
 """reinitialize db model
 
 Revision ID: 5336c1d5636a
-Revises: 
+Revises:
 Create Date: 2026-09-08 17:14:18.978181
 
 """
