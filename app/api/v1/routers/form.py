@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import secrets
 
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
@@ -29,6 +30,7 @@ from app.schemas.form import (
     FormUpdate,
     PageCreate,
     PageRead,
+    PublicFormRead,
     QuestionCreate,
     QuestionRead,
     QuestionUpdate,
@@ -125,6 +127,11 @@ def _link_questions(questions: list[Question]) -> None:
         question.next_id = questions[index + 1].question_id if index + 1 < len(questions) else None
 
 
+def _ensure_public_token(form: Form) -> None:
+    if not form.public_token:
+        form.public_token = secrets.token_urlsafe(18)
+
+
 @router.post("", response_model=FormRead, status_code=status.HTTP_201_CREATED)
 def create_form(
     data: FormCreate,
@@ -137,6 +144,8 @@ def create_form(
         content=data.content,
         status=data.status,
     )
+    if data.status == FormStatus.PUBLISHED:
+        _ensure_public_token(form)
     for page_data in data.pages:
         page = Page(
             title=page_data.title,
@@ -182,10 +191,10 @@ def get_form(
     return _form_query(db).filter(Form.form_id == form_id).one()
 
 
-@router.get("/{form_id}/public", response_model=FormRead)
-def get_published_form(form_id: str, db: Session = Depends(get_db)) -> Form:
+@router.get("/public/{public_token}", response_model=PublicFormRead)
+def get_published_form(public_token: str, db: Session = Depends(get_db)) -> Form:
     form = _public_form_query(db).filter(
-        Form.form_id == form_id,
+        Form.public_token == public_token,
         Form.status == FormStatus.PUBLISHED,
         Form.is_delete.is_(False),
     ).first()
@@ -204,6 +213,8 @@ def update_form(
     form = _owned_form(db, form_id, _user_id(payload))
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(form, field, value)
+    if form.status == FormStatus.PUBLISHED:
+        _ensure_public_token(form)
     db.commit()
     return _form_query(db).filter(Form.form_id == form_id).one()
 
@@ -423,16 +434,16 @@ def _serialize_response(response: FormResponse) -> FormResponseRead:
     )
 
 
-@router.post("/{form_id}/responses", response_model=FormResponseRead, status_code=status.HTTP_201_CREATED)
+@router.post("/public/{public_token}/responses", response_model=FormResponseRead, status_code=status.HTTP_201_CREATED)
 def submit_response(
-    form_id: str,
+    public_token: str,
     data: FormResponseCreate,
     db: Session = Depends(get_db),
 ) -> FormResponseRead:
     form = db.query(Form).options(
         selectinload(Form.questions).selectinload(Question.options)
     ).filter(
-        Form.form_id == form_id,
+        Form.public_token == public_token,
         Form.status == FormStatus.PUBLISHED,
         Form.is_delete.is_(False),
     ).first()
@@ -510,3 +521,155 @@ def list_responses(
         selectinload(FormResponse.answers).selectinload(Answer.selected_options)
     ).filter(FormResponse.form_id == form_id).order_by(FormResponse.submitted_at.desc()).all()
     return [_serialize_response(response) for response in responses]
+from datetime import datetime
+
+from app.core.exceptions import APIException
+from app.core.deps import return_payload
+from app.db.session import get_db
+from app.models.model import Account, Form, Question, Answer
+from app.schemas.form import FormAnswerRequest
+
+
+router = APIRouter()
+
+
+@router.post("/{form_id}/answers")
+def submit_form_answers(
+    form_id: str,
+    data: FormAnswerRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    payload = return_payload(request)
+
+    # TODO: confirm auth.py should store Account.user_id in payload["id"]
+    user_id = payload.get("id")
+
+    if not user_id:
+        raise APIException(
+            401,
+            "10005",
+            "invalid token payload"
+        )
+
+    # 確認登入使用者存在
+    account = (
+        db.query(Account)
+        .filter(
+            Account.user_id == user_id,
+            Account.is_delete == False
+        )
+        .first()
+    )
+
+    if not account:
+        raise APIException(
+            404,
+            "30001",
+            "account not found"
+        )
+
+    # 確認表單存在，而且尚未被刪除
+    form = (
+        db.query(Form)
+        .filter(
+            Form.form_id == form_id,
+            Form.is_delete == False
+        )
+        .first()
+    )
+
+    if not form:
+        raise APIException(
+            404,
+            "30002",
+            "form not found"
+        )
+
+    # 不接受空白提交
+    if not data.answers:
+        raise APIException(
+            400,
+            "30005",
+            "answers cannot be empty"
+        )
+
+    # 不接受一次提交中重複出現相同 question_id
+    question_ids = [item.question_id for item in data.answers]
+
+    if len(question_ids) != len(set(question_ids)):
+        raise APIException(
+            400,
+            "30006",
+            "duplicate question in answers"
+        )
+
+    # TODO: confirm whether users can resubmit/edit an answered form
+    existing_answer = (
+        db.query(Answer)
+        .filter(
+            Answer.form_id == form_id,
+            Answer.email == account.email,
+            Answer.is_delete == False
+        )
+        .first()
+    )
+
+    if existing_answer:
+        raise APIException(
+            400,
+            "30003",
+            "form already answered"
+        )
+
+    try:
+        for item in data.answers:
+            question = (
+                db.query(Question)
+                .filter(
+                    Question.question_id == item.question_id,
+                    Question.form_id == form_id,
+                    Question.is_delete == False
+                )
+                .first()
+            )
+
+            if not question:
+                raise APIException(
+                    404,
+                    "30004",
+                    f"question {item.question_id} not found"
+                )
+
+            answer = Answer(
+                form_id=form_id,
+                page_id=question.page_id,
+                question_id=question.question_id,
+                content=item.content,
+                email=account.email
+            )
+
+            db.add(answer)
+
+        db.commit()
+
+    except APIException:
+        db.rollback()
+        raise
+
+    except Exception:
+        db.rollback()
+        raise APIException(
+            500,
+            "50001",
+            "failed to submit form answers"
+            "50002",
+            "failed to delete form"
+        )
+
+    return {
+        "status_code": "20000",
+        "message": "form deleted successfully",
+        "response_datetime": datetime.now(),
+        "form_id": form_id
+    }

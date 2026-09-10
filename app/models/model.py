@@ -116,6 +116,7 @@ class Form(Base):
     __tablename__ = "forms"
 
     form_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    public_token = Column(String(32), unique=True, index=True)
     author_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False)
     title = Column(String(255))
     content = Column(Text)
