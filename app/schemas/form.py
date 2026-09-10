@@ -123,12 +123,20 @@ class FormStructureSave(BaseModel):
 
 class FormRead(ORMModel):
     form_id: str
+    public_token: Optional[str]
     author_id: str
     title: Optional[str]
     content: Optional[str]
     status: FormStatus
     create_time: Optional[datetime]
     update_time: Optional[datetime]
+    pages: list[PageRead] = Field(default_factory=list)
+
+
+class PublicFormRead(ORMModel):
+    public_token: str
+    title: Optional[str]
+    content: Optional[str]
     pages: list[PageRead] = Field(default_factory=list)
 
 
