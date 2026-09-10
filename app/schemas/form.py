@@ -162,3 +162,14 @@ class FormResponseRead(ORMModel):
     started_at: datetime
     submitted_at: Optional[datetime]
     answers: list[AnswerRead] = Field(default_factory=list)
+from pydantic import BaseModel
+from typing import Optional, List
+
+
+class AnswerItem(BaseModel):
+    question_id: str
+    content: Optional[str] = None
+
+
+class FormAnswerRequest(BaseModel):
+    answers: List[AnswerItem]
