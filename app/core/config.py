@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
@@ -16,7 +17,7 @@ class Settings(BaseSettings):
     app_name: str = "FastAPI Starter"
     app_version: str = "0.1.0"
     environment: str = "local"
-    debug: bool = False
+    debug: bool = Field(default=False, validation_alias="SROI_DEBUG")
     api_v1_prefix: str = "/api/v1"
     secret_key: str
     jwt_algorithm: str
