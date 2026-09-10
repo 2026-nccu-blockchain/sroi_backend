@@ -82,7 +82,7 @@ def add_group(request: Request, data: AddGroupRequest, db: Session = Depends(get
     user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
-    if user.role == Role.UNVERIFIED.value or user.role == Role.IN_PROGRESS.value:
+    if user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
         raise APIException(400, "10008", "permission denied")
     new_group = Group(
         title=data.title,
@@ -95,10 +95,7 @@ def add_group(request: Request, data: AddGroupRequest, db: Session = Depends(get
     db.add(new_group)
     db.commit()
     db.refresh(new_group)
-    if not user.group_list:
-        user.group_list = [f"{new_group.group_id}"]
-    else:
-        user.group_list = user.group_list + [f"{new_group.group_id}"]
+    user.group_list = (user.group_list or []) + [f"{new_group.group_id}"]
     db.commit()
 
     return APIResponse(
