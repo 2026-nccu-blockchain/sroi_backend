@@ -64,6 +64,19 @@ class Account(Base):
         email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(email_regex, email) is not None
 
+
+class VerifiedInProgress(Base):
+    __tablename__ = "verified_in_progress"
+
+    uuid  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    is_ver = Column(Boolean, nullable=False) # 是認證還是更改
+    campus_id = Column(String(36), nullable=False) # 教職員編號、學號
+    user_id = Column(String(36), nullable=False)
+    id_card_link = Column(String(255), nullable=False)
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
     
 class Group(Base):
     __tablename__ = "groups"
@@ -84,9 +97,13 @@ class Group(Base):
 class GroupAccount(Base):
     __tablename__ = "group_account"
 
-    group_id = Column(String(36), primary_key=True, nullable=False)
-    account_id = Column(String(36), primary_key=True, nullable=False)
+    uuid  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    group_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), nullable=False)
     group_role = Column(SQLEnum(Role), nullable=False)
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 class Result(Base):
