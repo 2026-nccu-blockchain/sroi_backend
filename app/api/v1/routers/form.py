@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import secrets
 
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
@@ -29,6 +30,7 @@ from app.schemas.form import (
     FormUpdate,
     PageCreate,
     PageRead,
+    PublicFormRead,
     QuestionCreate,
     QuestionRead,
     QuestionUpdate,
@@ -125,6 +127,11 @@ def _link_questions(questions: list[Question]) -> None:
         question.next_id = questions[index + 1].question_id if index + 1 < len(questions) else None
 
 
+def _ensure_public_token(form: Form) -> None:
+    if not form.public_token:
+        form.public_token = secrets.token_urlsafe(18)
+
+
 @router.post("", response_model=FormRead, status_code=status.HTTP_201_CREATED)
 def create_form(
     data: FormCreate,
@@ -137,6 +144,8 @@ def create_form(
         content=data.content,
         status=data.status,
     )
+    if data.status == FormStatus.PUBLISHED:
+        _ensure_public_token(form)
     for page_data in data.pages:
         page = Page(
             title=page_data.title,
@@ -182,10 +191,10 @@ def get_form(
     return _form_query(db).filter(Form.form_id == form_id).one()
 
 
-@router.get("/{form_id}/public", response_model=FormRead)
-def get_published_form(form_id: str, db: Session = Depends(get_db)) -> Form:
+@router.get("/public/{public_token}", response_model=PublicFormRead)
+def get_published_form(public_token: str, db: Session = Depends(get_db)) -> Form:
     form = _public_form_query(db).filter(
-        Form.form_id == form_id,
+        Form.public_token == public_token,
         Form.status == FormStatus.PUBLISHED,
         Form.is_delete.is_(False),
     ).first()
@@ -204,6 +213,8 @@ def update_form(
     form = _owned_form(db, form_id, _user_id(payload))
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(form, field, value)
+    if form.status == FormStatus.PUBLISHED:
+        _ensure_public_token(form)
     db.commit()
     return _form_query(db).filter(Form.form_id == form_id).one()
 
@@ -423,16 +434,16 @@ def _serialize_response(response: FormResponse) -> FormResponseRead:
     )
 
 
-@router.post("/{form_id}/responses", response_model=FormResponseRead, status_code=status.HTTP_201_CREATED)
+@router.post("/public/{public_token}/responses", response_model=FormResponseRead, status_code=status.HTTP_201_CREATED)
 def submit_response(
-    form_id: str,
+    public_token: str,
     data: FormResponseCreate,
     db: Session = Depends(get_db),
 ) -> FormResponseRead:
     form = db.query(Form).options(
         selectinload(Form.questions).selectinload(Question.options)
     ).filter(
-        Form.form_id == form_id,
+        Form.public_token == public_token,
         Form.status == FormStatus.PUBLISHED,
         Form.is_delete.is_(False),
     ).first()
