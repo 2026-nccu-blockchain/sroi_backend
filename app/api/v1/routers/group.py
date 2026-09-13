@@ -100,3 +100,40 @@ def delete_member(request: Request, GroupId: str, UserId: str, db: Session = Dep
         message="success",
         response_datetime=datetime.now(),
     )
+
+
+@router.get("/group_member/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def show_member(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    member = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
+    if member is None:
+        raise APIException(404, "10001", "user not found")
+    group_leaders = db.query(Account).filter(Account.user_id.in_(group.leader_list), Account.is_delete == False).all()
+    group_members = db.query(Account).filter(Account.user_id.in_(group.member_list), Account.is_delete == False).all()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        group_leader=[
+            {
+                "user_id": gl.user_id,
+                "campus_id": gl.campus_id,
+                "name": gl.name
+            }
+            for gl in group_leaders
+        ],
+        group_member=[
+            {
+                "user_id": gm.user_id,
+                "campus_id": gm.campus_id,
+                "name": gm.name
+            }
+            for gm in group_members
+        ],
+    )
