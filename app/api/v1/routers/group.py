@@ -60,3 +60,43 @@ def invite_group(request: Request, GroupId: str, data: InviteRequest, db: Sessio
         message="success",
         response_datetime=datetime.now(),
     )
+
+
+@router.delete("/delete_member", response_model=APIResponse, response_model_exclude_none=True)
+def delete_member(request: Request, GroupId: str, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    delete_member = db.query(GroupAccount).filter(GroupAccount.user_id == UserId, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
+    if delete_member is None:
+        raise APIException(404, "10001", "user not found")
+    group_leader = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == GroupId, 
+                                                 GroupAccount.group_role == Role.LEADER, GroupAccount.is_delete == False).first()
+    if group_leader is None:
+        raise APIException(400, "10008", "permission denied")
+    delete_member.is_delete = True
+    if delete_member.group_role == Role.LEADER:
+        group.leader_list = [
+            leader for leader in group.leader_list
+            if leader != UserId
+        ]
+    else:
+        group.member_list = [
+            member for member in group.member_list
+            if member != UserId
+        ]
+    user = db.query(Account).filter(Account.user_id == delete_member.user_id, Account.is_delete == False).first()
+    user.group_list = [
+        group for group in user.group_list
+        if group != GroupId
+    ]
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
