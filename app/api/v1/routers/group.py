@@ -62,7 +62,7 @@ def invite_group(request: Request, GroupId: str, data: InviteRequest, db: Sessio
     )
 
 
-@router.delete("/delete_member", response_model=APIResponse, response_model_exclude_none=True)
+@router.delete("/group_member", response_model=APIResponse, response_model_exclude_none=True)
 def delete_member(request: Request, GroupId: str, UserId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)

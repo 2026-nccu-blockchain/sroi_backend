@@ -103,3 +103,63 @@ def add_group(request: Request, data: AddGroupRequest, db: Session = Depends(get
         message="success",
         response_datetime=datetime.now(),
     )
+
+
+@router.get("/my_group", response_model=APIResponse, response_model_exclude_none=True)
+def my_group(request: Request, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    if user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
+        raise APIException(400, "10008", "permission denied")
+    group_list = user.group_list
+    groups = db.query(Group).filter(Group.group_id.in_(group_list)).all()
+    verified_group = []
+    in_progress_group = []
+    unverified_group = []
+    for group in groups:
+        if group.status == Role.VERIFIED:
+            verified_group.append(group)
+        elif group.status == Role.IN_PROGRESS:
+            in_progress_group.append(group)
+        elif group.status == Role.UNVERIFIED:
+            unverified_group.append(group)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        verified_group=[
+            {
+                "group_id": vg.group_id,
+                "title": vg.title,
+                "desc": vg.desc,
+                "begin": vg.begin,
+                "end": vg.end
+            }
+            for vg in verified_group
+        ],
+        in_progress_group=[
+            {
+                "group_id": ipg.group_id,
+                "title": ipg.title,
+                "desc": ipg.desc,
+                "begin": ipg.begin,
+                "end": ipg.end
+            }
+            for ipg in in_progress_group
+        ],
+        unverified_group=[
+            {
+                "group_id": uvg.group_id,
+                "title": uvg.title,
+                "desc": uvg.desc,
+                "begin": uvg.begin,
+                "end": uvg.end
+            }
+            for uvg in unverified_group
+        ],
+    )
