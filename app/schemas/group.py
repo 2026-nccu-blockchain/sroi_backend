@@ -5,3 +5,7 @@ from typing import Optional
 class InviteRequest(BaseModel):
     campus_id: str
     is_leader: bool
+
+class ChangeRoleRequest(BaseModel):
+    user_id: str
+    is_leader: bool
