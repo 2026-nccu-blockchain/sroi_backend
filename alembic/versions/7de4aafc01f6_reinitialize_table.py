@@ -1,8 +1,8 @@
-"""reinitialize db model
+"""reinitialize table
 
-Revision ID: 5336c1d5636a
-Revises:
-Create Date: 2026-09-08 17:14:18.978181
+Revision ID: 7de4aafc01f6
+Revises: 
+Create Date: 2026-09-13 17:27:34.280563
 
 """
 from typing import Sequence, Union
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = '5336c1d5636a'
+revision: str = '7de4aafc01f6'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
@@ -36,11 +36,16 @@ def upgrade() -> None:
     )
     op.create_index(op.f('ix_accounts_user_id'), 'accounts', ['user_id'], unique=False)
     op.create_table('group_account',
+    sa.Column('uuid', sa.String(length=36), nullable=False),
     sa.Column('group_id', sa.String(length=36), nullable=False),
-    sa.Column('account_id', sa.String(length=36), nullable=False),
+    sa.Column('user_id', sa.String(length=36), nullable=False),
     sa.Column('group_role', sa.Enum('ADMIN', 'DB_EDITOR', 'VERIFIED', 'IN_PROGRESS', 'UNVERIFIED', 'LEADER', 'MEMBER', name='role'), nullable=False),
-    sa.PrimaryKeyConstraint('group_id', 'account_id')
+    sa.Column('is_delete', sa.Boolean(), nullable=False),
+    sa.Column('create_time', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
+    sa.Column('update_time', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('uuid')
     )
+    op.create_index(op.f('ix_group_account_uuid'), 'group_account', ['uuid'], unique=False)
     op.create_table('groups',
     sa.Column('group_id', sa.String(length=36), nullable=False),
     sa.Column('title', sa.String(length=255), nullable=False),
@@ -62,11 +67,25 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('result_id')
     )
     op.create_index(op.f('ix_results_result_id'), 'results', ['result_id'], unique=False)
+    op.create_table('verified_in_progress',
+    sa.Column('uuid', sa.String(length=36), nullable=False),
+    sa.Column('is_ver', sa.Boolean(), nullable=False),
+    sa.Column('campus_id', sa.String(length=36), nullable=False),
+    sa.Column('user_id', sa.String(length=36), nullable=False),
+    sa.Column('id_card_link', sa.String(length=255), nullable=False),
+    sa.Column('is_delete', sa.Boolean(), nullable=False),
+    sa.Column('create_time', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
+    sa.Column('update_time', sa.DateTime(timezone=True), nullable=True),
+    sa.PrimaryKeyConstraint('uuid')
+    )
+    op.create_index(op.f('ix_verified_in_progress_uuid'), 'verified_in_progress', ['uuid'], unique=False)
     op.create_table('forms',
     sa.Column('form_id', sa.String(length=36), nullable=False),
+    sa.Column('public_token', sa.String(length=32), nullable=True),
     sa.Column('author_id', sa.String(length=36), nullable=False),
     sa.Column('title', sa.String(length=255), nullable=True),
-    sa.Column('content', sa.String(length=255), nullable=True),
+    sa.Column('content', sa.Text(), nullable=True),
+    sa.Column('status', sa.Enum('DRAFT', 'PUBLISHED', 'CLOSED', name='formstatus'), nullable=False),
     sa.Column('result_id_list', postgresql.ARRAY(sa.String(length=255)), nullable=True),
     sa.Column('is_delete', sa.Boolean(), nullable=False),
     sa.Column('create_time', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
@@ -75,11 +94,25 @@ def upgrade() -> None:
     sa.PrimaryKeyConstraint('form_id')
     )
     op.create_index(op.f('ix_forms_form_id'), 'forms', ['form_id'], unique=False)
+    op.create_index(op.f('ix_forms_public_token'), 'forms', ['public_token'], unique=True)
+    op.create_table('form_responses',
+    sa.Column('response_id', sa.String(length=36), nullable=False),
+    sa.Column('form_id', sa.String(length=36), nullable=False),
+    sa.Column('respondent_email', sa.String(length=255), nullable=True),
+    sa.Column('status', sa.Enum('DRAFT', 'SUBMITTED', name='responsestatus'), nullable=False),
+    sa.Column('started_at', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=False),
+    sa.Column('submitted_at', sa.DateTime(timezone=True), nullable=True),
+    sa.ForeignKeyConstraint(['form_id'], ['forms.form_id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('response_id')
+    )
+    op.create_index(op.f('ix_form_responses_form_id'), 'form_responses', ['form_id'], unique=False)
+    op.create_index(op.f('ix_form_responses_response_id'), 'form_responses', ['response_id'], unique=False)
     op.create_table('pages',
     sa.Column('page_id', sa.String(length=36), nullable=False),
     sa.Column('form_id', sa.String(length=36), nullable=False),
     sa.Column('title', sa.String(length=255), nullable=True),
     sa.Column('content', sa.Text(), nullable=False),
+    sa.Column('position', sa.Integer(), nullable=False),
     sa.Column('is_delete', sa.Boolean(), nullable=False),
     sa.Column('create_time', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
     sa.Column('update_time', sa.DateTime(timezone=True), nullable=True),
@@ -95,12 +128,15 @@ def upgrade() -> None:
     sa.Column('result_id', sa.String(length=36), nullable=True),
     sa.Column('title', sa.String(length=255), nullable=True),
     sa.Column('content', sa.Text(), nullable=False),
+    sa.Column('is_required', sa.Boolean(), nullable=False),
+    sa.Column('position', sa.Integer(), nullable=False),
     sa.Column('scale_begin', sa.Integer(), nullable=True),
     sa.Column('scale_end', sa.Integer(), nullable=True),
     sa.Column('options', postgresql.ARRAY(sa.String(length=255)), nullable=True),
     sa.Column('is_multiple', sa.Boolean(), nullable=False),
     sa.Column('pre_id', sa.String(length=36), nullable=True),
     sa.Column('next_id', sa.String(length=36), nullable=True),
+    sa.Column('jump_rules', postgresql.JSONB(astext_type=sa.Text()), nullable=False),
     sa.Column('is_temp', sa.Boolean(), nullable=False),
     sa.Column('is_delete', sa.Boolean(), nullable=False),
     sa.Column('create_time', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
@@ -115,34 +151,73 @@ def upgrade() -> None:
     sa.Column('form_id', sa.String(length=36), nullable=False),
     sa.Column('page_id', sa.String(length=36), nullable=False),
     sa.Column('question_id', sa.String(length=36), nullable=False),
+    sa.Column('response_id', sa.String(length=36), nullable=True),
     sa.Column('content', sa.Text(), nullable=True),
-    sa.Column('email', sa.String(length=255), nullable=False),
+    sa.Column('number_value', sa.Integer(), nullable=True),
+    sa.Column('date_value', sa.Date(), nullable=True),
+    sa.Column('email', sa.String(length=255), nullable=True),
     sa.Column('is_delete', sa.Boolean(), nullable=False),
     sa.Column('create_time', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
     sa.Column('update_time', sa.DateTime(timezone=True), nullable=True),
     sa.ForeignKeyConstraint(['form_id'], ['forms.form_id'], ),
     sa.ForeignKeyConstraint(['page_id'], ['pages.page_id'], ),
     sa.ForeignKeyConstraint(['question_id'], ['questions.question_id'], ),
-    sa.PrimaryKeyConstraint('answer_id')
+    sa.ForeignKeyConstraint(['response_id'], ['form_responses.response_id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('answer_id'),
+    sa.UniqueConstraint('response_id', 'question_id', name='uq_response_question_answer')
     )
     op.create_index(op.f('ix_answers_answer_id'), 'answers', ['answer_id'], unique=False)
+    op.create_index(op.f('ix_answers_response_id'), 'answers', ['response_id'], unique=False)
+    op.create_table('question_options',
+    sa.Column('option_id', sa.String(length=36), nullable=False),
+    sa.Column('question_id', sa.String(length=36), nullable=False),
+    sa.Column('label', sa.String(length=255), nullable=False),
+    sa.Column('value', sa.String(length=255), nullable=False),
+    sa.Column('position', sa.Integer(), nullable=False),
+    sa.Column('is_delete', sa.Boolean(), nullable=False),
+    sa.Column('create_time', sa.DateTime(timezone=True), server_default=sa.text('now()'), nullable=True),
+    sa.Column('update_time', sa.DateTime(timezone=True), nullable=True),
+    sa.ForeignKeyConstraint(['question_id'], ['questions.question_id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('option_id')
+    )
+    op.create_index(op.f('ix_question_options_option_id'), 'question_options', ['option_id'], unique=False)
+    op.create_index(op.f('ix_question_options_question_id'), 'question_options', ['question_id'], unique=False)
+    op.create_table('answer_choices',
+    sa.Column('answer_id', sa.String(length=36), nullable=False),
+    sa.Column('option_id', sa.String(length=36), nullable=False),
+    sa.ForeignKeyConstraint(['answer_id'], ['answers.answer_id'], ondelete='CASCADE'),
+    sa.ForeignKeyConstraint(['option_id'], ['question_options.option_id'], ondelete='CASCADE'),
+    sa.PrimaryKeyConstraint('answer_id', 'option_id')
+    )
     # ### end Alembic commands ###
 
 
 def downgrade() -> None:
     # ### commands auto generated by Alembic - please adjust! ###
+    op.drop_table('answer_choices')
+    op.drop_index(op.f('ix_question_options_question_id'), table_name='question_options')
+    op.drop_index(op.f('ix_question_options_option_id'), table_name='question_options')
+    op.drop_table('question_options')
+    op.drop_index(op.f('ix_answers_response_id'), table_name='answers')
     op.drop_index(op.f('ix_answers_answer_id'), table_name='answers')
     op.drop_table('answers')
     op.drop_index(op.f('ix_questions_question_id'), table_name='questions')
     op.drop_table('questions')
     op.drop_index(op.f('ix_pages_page_id'), table_name='pages')
     op.drop_table('pages')
+    op.drop_index(op.f('ix_form_responses_response_id'), table_name='form_responses')
+    op.drop_index(op.f('ix_form_responses_form_id'), table_name='form_responses')
+    op.drop_table('form_responses')
+    op.drop_index(op.f('ix_forms_public_token'), table_name='forms')
     op.drop_index(op.f('ix_forms_form_id'), table_name='forms')
     op.drop_table('forms')
+    op.drop_index(op.f('ix_verified_in_progress_uuid'), table_name='verified_in_progress')
+    op.drop_table('verified_in_progress')
     op.drop_index(op.f('ix_results_result_id'), table_name='results')
     op.drop_table('results')
     op.drop_index(op.f('ix_groups_group_id'), table_name='groups')
     op.drop_table('groups')
+    op.drop_index(op.f('ix_group_account_uuid'), table_name='group_account')
     op.drop_table('group_account')
     op.drop_index(op.f('ix_accounts_user_id'), table_name='accounts')
     op.drop_table('accounts')
