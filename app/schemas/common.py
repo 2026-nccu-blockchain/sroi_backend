@@ -16,6 +16,11 @@ class APIResponse(BaseModel):
     unverified_group: Optional[list] = None
     group_leader: Optional[list] = None
     group_member: Optional[list] = None
+    admin: Optional[list] = None
+    db_editor: Optional[list] = None
+    verified_user: Optional[list] = None
+    in_progress_user: Optional[list] = None
+    unverified_user: Optional[list] = None
     
 
 # 錯誤回應的格式 

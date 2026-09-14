@@ -173,3 +173,78 @@ def unconfirm_group(request: Request, GroupId: str, db: Session = Depends(get_db
         message="success",
         response_datetime=datetime.now(),
     )
+
+
+@router.get("/all_user", response_model=APIResponse, response_model_exclude_none=True)
+def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    all_user = db.query(Account).filter(Account.is_delete == False).all()
+    admin = []
+    db_editor = []
+    verified_user = []
+    in_progress_user = []
+    unverified_user = []
+    for user in all_user:
+        if user.role == Role.ADMIN:
+            admin.append(user)
+        elif user.role == Role.DB_EDITOR:
+            db_editor.append(user)
+        elif user.role == Role.VERIFIED:
+            verified_user.append(user)
+        elif user.role == Role.IN_PROGRESS:
+            in_progress_user.append(user)
+        elif user.role == Role.UNVERIFIED:
+            unverified_user.append(user)
+    
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        admin=[
+            {
+                "user_id": a.user_id,
+                "campus_id": a.campus_id,
+                "name": a.name
+            }
+            for a in admin
+        ],
+        db_editor=[
+            {
+                "user_id": de.user_id,
+                "campus_id": de.campus_id,
+                "name": de.name
+            }
+            for de in db_editor
+        ],
+        verified_user=[
+            {
+                "user_id": vu.user_id,
+                "campus_id": vu.campus_id,
+                "name": vu.name
+            }
+            for vu in verified_user
+        ],
+        in_progress_user=[
+            {
+                "user_id": ipu.user_id,
+                "campus_id": ipu.campus_id,
+                "name": ipu.name
+            }
+            for ipu in in_progress_user
+        ],
+        unverified_user=[
+            {
+                "user_id": uvu.user_id,
+                "campus_id": uvu.campus_id,
+                "name": uvu.name
+            }
+            for uvu in unverified_user
+        ],
+    )
