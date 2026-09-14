@@ -17,7 +17,11 @@ router = APIRouter()
 def confirm_verification(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
-    if payload["role"] != Role.ADMIN.value:
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None or user.role != Role.IN_PROGRESS:
@@ -42,7 +46,11 @@ def confirm_verification(request: Request, UserId: str, db: Session = Depends(ge
 def unconfirm_verification(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
-    if payload["role"] != Role.ADMIN.value:
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None or user.role != Role.IN_PROGRESS:
@@ -65,7 +73,11 @@ def unconfirm_verification(request: Request, UserId: str, db: Session = Depends(
 def confirm_change(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
-    if payload["role"] != Role.ADMIN.value:
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None or user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
@@ -89,7 +101,11 @@ def confirm_change(request: Request, UserId: str, db: Session = Depends(get_db))
 def unconfirm_change(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
-    if payload["role"] != Role.ADMIN.value:
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None or user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
@@ -111,7 +127,11 @@ def unconfirm_change(request: Request, UserId: str, db: Session = Depends(get_db
 def confirm_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
-    if payload["role"] != Role.ADMIN.value:
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.IN_PROGRESS, Group.is_delete == False).first()
     if group is None:
@@ -136,7 +156,11 @@ def confirm_group(request: Request, GroupId: str, db: Session = Depends(get_db))
 def unconfirm_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
-    if payload["role"] != Role.ADMIN.value:
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.IN_PROGRESS, Group.is_delete == False).first()
     if group is None:
