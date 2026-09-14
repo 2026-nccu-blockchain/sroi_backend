@@ -342,3 +342,26 @@ def remove_admin(request: Request, UserId: str, db: Session = Depends(get_db)) -
         message="success",
         response_datetime=datetime.now(),
     )
+
+
+@router.delete("/delete_user/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def delete_user(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    user.is_delete = True
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
