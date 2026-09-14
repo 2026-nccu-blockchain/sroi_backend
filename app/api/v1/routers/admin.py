@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Request, Depends
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from app.db.session import get_db
 from app.models.model import Role, Account, VerifiedInProgress, Group, GroupAccount
@@ -284,6 +285,53 @@ def remove_db_editor(request: Request, UserId: str, db: Session = Depends(get_db
     if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     user = db.query(Account).filter(Account.user_id == UserId, Account.role == Role.DB_EDITOR, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    user.role = Role.VERIFIED
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/add_admin/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def add_admin(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, 
+                                    or_(Account.role == Role.VERIFIED, Account.role == Role.DB_EDITOR), Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    user.role = Role.ADMIN
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/remove_admin/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def remove_admin(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, Account.role == Role.ADMIN, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
     user.role = Role.VERIFIED
