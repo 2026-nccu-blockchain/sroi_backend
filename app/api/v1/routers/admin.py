@@ -248,3 +248,49 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             for uvu in unverified_user
         ],
     )
+
+
+@router.post("/add_db_editor/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def add_db_editor(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, Account.role == Role.VERIFIED, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    user.role = Role.DB_EDITOR
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/remove_db_editor/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def remove_db_editor(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, Account.role == Role.DB_EDITOR, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    user.role = Role.VERIFIED
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
