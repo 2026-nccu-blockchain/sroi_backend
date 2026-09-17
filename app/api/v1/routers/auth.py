@@ -51,10 +51,10 @@ def user_login(data: LoginRequest, db: Session = Depends(get_db)) -> dict:
 def user_register(data: RegisterRequest, db: Session = Depends(get_db)) -> dict:
     if not Account.verify_email(data.email):
         raise APIException(400, "10007", "incorrect email format")
+    if db.query(Account).filter(Account.email == data.email, Account.is_delete == False).first() is not None:
+            raise APIException(400, "10006", "register duplicate")
     if not is_strong_password(data.password):
         raise APIException(400, "10010", "password is not strong")
-    if db.query(Account).filter(Account.email == data.email, Account.is_delete == False).first() is not None:
-        raise APIException(400, "10006", "register duplicate")
     new_account = Account(
         email=data.email,
         hash_password=" ", #不能是null，下面才會設密碼,
