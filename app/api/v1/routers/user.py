@@ -163,3 +163,25 @@ def my_group(request: Request, db: Session = Depends(get_db)) -> dict:
             for uvg in unverified_group
         ],
     )
+
+
+@router.get("/profile", response_model=APIResponse, response_model_exclude_none=True)
+def my_profile(request: Request, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    if user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
+        raise APIException(400, "10008", "permission denied")
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        user_id=user.user_id,
+        campus_id=user.campus_id,
+        email=user.email,
+        name=user.name
+    )
