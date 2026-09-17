@@ -40,7 +40,7 @@ router = APIRouter()
 
 
 def _user_id(payload: dict) -> str:
-    user_id = payload.get("id")
+    user_id = payload.get("user_id")
     if not user_id:
         raise APIException(401, "10005", "Invalid token payload")
     return str(user_id)
