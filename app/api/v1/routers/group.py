@@ -7,7 +7,8 @@ from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
 from app.schemas.group import (
-    InviteRequest
+    InviteRequest,
+    ChangeRoleRequest
 )
 import re
 
@@ -62,7 +63,52 @@ def invite_group(request: Request, GroupId: str, data: InviteRequest, db: Sessio
     )
 
 
-@router.delete("/delete_member", response_model=APIResponse, response_model_exclude_none=True)
+@router.post("/change_permission/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def change_permission(request: Request, GroupId: str, data: ChangeRoleRequest, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    change_user = db.query(Account).filter(Account.user_id == data.user_id, Account.role != Role.UNVERIFIED, 
+                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    if change_user is None:
+        raise APIException(404, "10001", "user not found")
+    user = db.query(Account).filter(Account.user_id == user_id, Account.role != Role.UNVERIFIED, 
+                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    group_leader = db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == user_id, 
+                                                 GroupAccount.group_role == Role.LEADER, GroupAccount.is_delete == False).first()
+    if user is None or group_leader is None:
+        raise APIException(400, "10008", "permission denied")
+    if group_leader.user_id == change_user.user_id:
+        raise APIException(400, "10015", "can't change own permissions")
+    change = db.query(GroupAccount).filter(GroupAccount.user_id == data.user_id, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
+    if data.is_leader:
+        change.group_role = Role.LEADER
+        group.member_list = [
+            member for member in group.member_list
+            if member != data.user_id
+        ]
+        group.leader_list = (group.leader_list or []) + [f"{data.user_id}"]
+
+    else:
+        change.group_role = Role.MEMBER
+        group.leader_list = [
+            leader for leader in group.leader_list
+            if leader != data.user_id
+        ]
+        group.member_list = (group.member_list or []) + [f"{data.user_id}"]
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.delete("/group_member", response_model=APIResponse, response_model_exclude_none=True)
 def delete_member(request: Request, GroupId: str, UserId: str, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
@@ -99,4 +145,41 @@ def delete_member(request: Request, GroupId: str, UserId: str, db: Session = Dep
         status_code="00000",
         message="success",
         response_datetime=datetime.now(),
+    )
+
+
+@router.get("/group_member/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def show_member(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    member = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
+    if member is None:
+        raise APIException(404, "10001", "user not found")
+    group_leaders = db.query(Account).filter(Account.user_id.in_(group.leader_list), Account.is_delete == False).all()
+    group_members = db.query(Account).filter(Account.user_id.in_(group.member_list), Account.is_delete == False).all()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        group_leader=[
+            {
+                "user_id": gl.user_id,
+                "campus_id": gl.campus_id,
+                "name": gl.name
+            }
+            for gl in group_leaders
+        ],
+        group_member=[
+            {
+                "user_id": gm.user_id,
+                "campus_id": gm.campus_id,
+                "name": gm.name
+            }
+            for gm in group_members
+        ],
     )

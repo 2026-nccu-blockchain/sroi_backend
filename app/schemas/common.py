@@ -11,6 +11,16 @@ class APIResponse(BaseModel):
     # 不加 data 欄位，或直接把要回傳的欄位寫在這層
     # 其他欄位依需求加
     token: Optional[str] = None
+    verified_group: Optional[list] = None
+    in_progress_group: Optional[list] = None
+    unverified_group: Optional[list] = None
+    group_leader: Optional[list] = None
+    group_member: Optional[list] = None
+    admin: Optional[list] = None
+    db_editor: Optional[list] = None
+    verified_user: Optional[list] = None
+    in_progress_user: Optional[list] = None
+    unverified_user: Optional[list] = None
     
 
 # 錯誤回應的格式 

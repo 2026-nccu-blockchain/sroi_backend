@@ -36,7 +36,7 @@ def user_login(data: LoginRequest, db: Session = Depends(get_db)) -> dict:
         raise APIException(404, "10001", "user not found")
     if not user.verify_password(data.password):
         raise APIException(400, "10002", "invalid password")
-    payload = {"user_id": f"{user.user_id}", "role": f"{user.role.value}"}
+    payload = {"user_id": f"{user.user_id}"}
     token = create_access_token(payload)
     
     return APIResponse(
