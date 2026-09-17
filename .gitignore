@@ -23,3 +23,6 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+# test
+test.py
