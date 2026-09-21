@@ -18,7 +18,7 @@ WINDOW_SECONDS=settings.window_seconds
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
-    debug=settings.debug,
+    debug=settings.sroi_debug,
 )
 
 app.add_middleware(CustomHeaderMiddleware)
