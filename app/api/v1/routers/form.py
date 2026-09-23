@@ -30,6 +30,7 @@ from app.schemas.form import (
     FormUpdate,
     PageCreate,
     PageRead,
+    PageUpdate,
     PublicFormRead,
     QuestionCreate,
     QuestionRead,
@@ -132,6 +133,31 @@ def _ensure_public_token(form: Form) -> None:
         form.public_token = secrets.token_urlsafe(18)
 
 
+def _validate_form_for_publish(form: Form) -> None:
+    if not form.title or not form.title.strip():
+        raise APIException(400, "20026", "Form title is required before publishing")
+    active_pages = [page for page in form.pages if not page.is_delete]
+    if not active_pages:
+        raise APIException(400, "20027", "At least one block is required before publishing")
+    for page in active_pages:
+        if not page.title or not page.title.strip():
+            raise APIException(400, "20028", "Every block needs a title before publishing")
+        active_questions = [
+            question for question in page.questions
+            if not question.is_delete and not question.is_temp
+        ]
+        if not any(question.question_type != QuestionType.DS for question in active_questions):
+            raise APIException(400, "20029", f"Block has no answerable question: {page.page_id}")
+        for question in active_questions:
+            question_text = question.content if question.question_type == QuestionType.DS else question.title
+            if not question_text or not question_text.strip():
+                raise APIException(400, "20030", f"Question is incomplete: {question.question_id}")
+            if question.question_type == QuestionType.CQ:
+                active_options = [option for option in question.options if not option.is_delete]
+                if not active_options or any(not option.label.strip() for option in active_options):
+                    raise APIException(400, "20031", f"Choice options are incomplete: {question.question_id}")
+
+
 @router.post("", response_model=FormRead, status_code=status.HTTP_201_CREATED)
 def create_form(
     data: FormCreate,
@@ -214,6 +240,8 @@ def update_form(
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(form, field, value)
     if form.status == FormStatus.PUBLISHED:
+        publishable_form = _form_query(db).filter(Form.form_id == form_id).one()
+        _validate_form_for_publish(publishable_form)
         _ensure_public_token(form)
     db.commit()
     return _form_query(db).filter(Form.form_id == form_id).one()
@@ -300,6 +328,54 @@ def create_page(
     db.commit()
     db.refresh(page)
     return page
+
+
+@router.patch("/pages/{page_id}", response_model=PageRead)
+def update_page(
+    page_id: str,
+    data: PageUpdate,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Page:
+    page = db.query(Page).join(Form).filter(
+        Page.page_id == page_id,
+        Page.is_delete.is_(False),
+        Form.author_id == _user_id(payload),
+        Form.is_delete.is_(False),
+    ).first()
+    if page is None:
+        raise APIException(404, "20002", "Page not found")
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(page, field, value)
+    db.commit()
+    db.refresh(page)
+    return page
+
+
+@router.delete("/pages/{page_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_page(
+    page_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> None:
+    page = db.query(Page).options(selectinload(Page.questions)).join(Form).filter(
+        Page.page_id == page_id,
+        Page.is_delete.is_(False),
+        Form.author_id == _user_id(payload),
+        Form.is_delete.is_(False),
+    ).first()
+    if page is None:
+        raise APIException(404, "20002", "Page not found")
+    active_page_count = db.query(Page).filter(
+        Page.form_id == page.form_id,
+        Page.is_delete.is_(False),
+    ).count()
+    if active_page_count <= 1:
+        raise APIException(400, "20025", "A form must keep at least one block")
+    page.is_delete = True
+    for question in page.questions:
+        question.is_delete = True
+    db.commit()
 
 
 @router.post("/{form_id}/pages/{page_id}/questions", response_model=QuestionRead, status_code=status.HTTP_201_CREATED)

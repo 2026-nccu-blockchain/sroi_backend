@@ -91,6 +91,12 @@ class PageCreate(BaseModel):
     questions: list[QuestionCreate] = Field(default_factory=list)
 
 
+class PageUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=255)
+    content: Optional[str] = None
+    position: Optional[int] = Field(default=None, ge=0)
+
+
 class PageRead(ORMModel):
     page_id: str
     title: Optional[str]
