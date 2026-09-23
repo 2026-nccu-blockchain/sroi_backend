@@ -149,8 +149,8 @@ class AnswerInput(BaseModel):
 
 
 class FormResponseCreate(BaseModel):
-    respondent_email: Optional[EmailStr] = None
-    answers: list[AnswerInput] = Field(min_length=1)
+    respondent_email: EmailStr
+    answers: list[AnswerInput] = Field(default_factory=list)
 
 
 class AnswerRead(ORMModel):

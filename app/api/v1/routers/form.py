@@ -481,7 +481,7 @@ def submit_response(
 
     response = FormResponse(
         form=form,
-        respondent_email=str(data.respondent_email) if data.respondent_email else None,
+        respondent_email=str(data.respondent_email),
         status=ResponseStatus.SUBMITTED,
         submitted_at=datetime.now(timezone.utc),
     )
