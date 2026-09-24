@@ -133,7 +133,6 @@ class Form(Base):
 
     responses = relationship("FormResponse", back_populates="form", cascade="all, delete-orphan")
 
-    status = Column(String(9), nullable=False)
 
 
 class Page(Base):
