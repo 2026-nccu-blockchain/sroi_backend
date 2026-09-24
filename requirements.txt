@@ -8,3 +8,4 @@ email-validator
 PyJWT
 bcrypt
 alembic
+python-multipart
