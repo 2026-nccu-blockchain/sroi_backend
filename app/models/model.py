@@ -133,8 +133,6 @@ class Form(Base):
 
     responses = relationship("FormResponse", back_populates="form", cascade="all, delete-orphan")
 
-    status = Column(String(9), nullable=False)
-
 
 class Page(Base):
     __tablename__ = "pages"
@@ -277,4 +275,3 @@ class AnswerChoice(Base):
 
     answer = relationship("Answer", back_populates="selected_options")
     option = relationship("QuestionOption", back_populates="answer_choices")
-
