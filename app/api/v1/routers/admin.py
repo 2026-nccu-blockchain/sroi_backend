@@ -8,8 +8,9 @@ from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
-# from app.schemas.admin import (
-# )
+from app.schemas.admin import (
+    UnconfirmGroupRequest
+)
 import re
 from pathlib import Path
 
@@ -181,7 +182,7 @@ def confirm_group(request: Request, GroupId: str, db: Session = Depends(get_db))
 
 
 @router.post("/unconfirm_group/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
-def unconfirm_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+def unconfirm_group(request: Request, GroupId: str, data: UnconfirmGroupRequest, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
     admin_id = payload["user_id"]
@@ -194,6 +195,7 @@ def unconfirm_group(request: Request, GroupId: str, db: Session = Depends(get_db
     if group is None:
         raise APIException(404, "10013", "group not found")
     group.status = Role.UNVERIFIED
+    group.reason = data.reason
     db.commit()
 
     return APIResponse(
@@ -348,6 +350,113 @@ def show_one_user(request: Request, UserId: str, db: Session = Depends(get_db)) 
         name=user.name,
         email=user.email,
         role=user.role.value,
+    )
+
+
+@router.get("/all_groups", response_model=APIResponse, response_model_exclude_none=True)
+def show_all_groups(request: Request, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")    
+    all_groups = db.query(Group).filter(Group.is_delete == False).all()
+    agree_groups = []
+    in_progress_groups = []
+    disagree_groups = []
+    for group in all_groups:
+        if group.status == Role.VERIFIED:
+            agree_groups.append(group)
+        elif group.status == Role.IN_PROGRESS:
+            in_progress_groups.append(group)
+        elif group.status == Role.UNVERIFIED:
+            disagree_groups.append(group)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        agree_groups=[
+            {
+                "group_id": ag.group_id,
+                "title": ag.title,
+                "desc": ag.desc,
+                "begin": ag.begin,
+                "end": ag.end
+            }
+            for ag in agree_groups
+        ],
+        in_progress_groups=[
+            {
+                "group_id": ipg.group_id,
+                "title": ipg.title,
+                "desc": ipg.desc,
+                "begin": ipg.begin,
+                "end": ipg.end
+            }
+            for ipg in in_progress_groups
+        ],
+        disagree_groups=[
+            {
+                "group_id": dg.group_id,
+                "title": dg.title,
+                "desc": dg.desc,
+                "begin": dg.begin,
+                "end": dg.end,
+                "reason": dg.reason
+            }
+            for dg in disagree_groups
+        ],
+    )
+
+
+@router.get("/one_group/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def show_one_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    # 管理員可以看任何狀態的群組
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    group_leaders = db.query(Account).filter(Account.user_id.in_(group.leader_list or []), Account.is_delete == False).all()
+    group_members = db.query(Account).filter(Account.user_id.in_(group.member_list or []), Account.is_delete == False).all()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        group_id=group.group_id,
+        title=group.title,
+        desc=group.desc,
+        begin=group.begin,
+        end=group.end,
+        status=group.status.value,
+        reason=group.reason,
+        group_leaders=[
+            {
+                "user_id": gl.user_id,
+                "campus_id": gl.campus_id,
+                "name": gl.name
+            }
+            for gl in group_leaders
+        ],
+        group_members=[
+            {
+                "user_id": gm.user_id,
+                "campus_id": gm.campus_id,
+                "name": gm.name
+            }
+            for gm in group_members
+        ],
     )
 
 

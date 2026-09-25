@@ -4,6 +4,7 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from app.db.base import Base
 from enum import Enum
+from typing import Optional
 import uuid
 import bcrypt
 import re
@@ -64,6 +65,18 @@ class Account(Base):
         email_regex = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(email_regex, email) is not None
 
+    @staticmethod
+    def campus_id_taken(db, campus_id: str, exclude_user_id: Optional[str] = None) -> bool:
+        # 已審核通過（已驗證、資料庫編輯者、管理員）的帳號佔用中的學號
+        query = db.query(Account).filter(
+            Account.campus_id == campus_id,
+            Account.role.notin_([Role.UNVERIFIED, Role.IN_PROGRESS]),
+            Account.is_delete == False,
+        )
+        if exclude_user_id is not None:
+            query = query.filter(Account.user_id != exclude_user_id)
+        return query.first() is not None
+
 
 class VerifiedInProgress(Base):
     __tablename__ = "verified_in_progress"
@@ -89,6 +102,7 @@ class Group(Base):
     status = Column(SQLEnum(Role), nullable=False)
     leader_list = Column(ARRAY(String(255)))
     member_list = Column(ARRAY(String(255)))
+    reason = Column(Text, nullable=True)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
