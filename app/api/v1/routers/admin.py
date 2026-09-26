@@ -8,6 +8,7 @@ from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
+from app.api.v1.routers.upload import MEDIA_TYPES
 from app.schemas.admin import (
     UnconfirmGroupRequest
 )
@@ -474,7 +475,7 @@ def get_id_card(request: Request, filename: str, db: Session = Depends(get_db)):
     path = (UPLOAD_DIR / filename).resolve()
     if path.parent != UPLOAD_DIR or not path.is_file():
         raise APIException(404, "10021", "image not found")
-    return FileResponse(path)
+    return FileResponse(path, media_type=MEDIA_TYPES.get(path.suffix, "application/octet-stream"))
 
 
 @router.post("/add_db_editor/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
