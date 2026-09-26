@@ -8,3 +8,6 @@ email-validator
 PyJWT
 bcrypt
 alembic
+python-multipart
+pillow
+pillow-heif
