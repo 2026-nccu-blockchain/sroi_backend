@@ -8,20 +8,23 @@ from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
 from app.schemas.user import (
     VerificationRequest,
-    AddGroupRequest
+    AddGroupRequest,
 )
-import re
+from pathlib import Path
 
 router = APIRouter()
 
+UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "images"
 
 @router.post("/request_verification", response_model=APIResponse, response_model_exclude_none=True)
 def request_verification(request: Request, data: VerificationRequest, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    if db.query(Account).filter(Account.campus_id == data.campus_id, Account.role == Role.VERIFIED, Account.is_delete == False).first() is not None:
-        raise APIException(400, "10011", "already verified")
+    if not data.id_card_link.startswith(f"{user_id}_") or not (UPLOAD_DIR / data.id_card_link).is_file():
+        raise APIException(400, "10020", "invalid id card link")
+    if Account.campus_id_taken(db, data.campus_id):
+        raise APIException(400, "10012", "the same campus id")
     user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
@@ -50,13 +53,21 @@ def change_campus_id(request: Request, data: VerificationRequest, db: Session = 
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    if db.query(Account).filter(Account.campus_id == data.campus_id, Account.role != Role.UNVERIFIED, Account.Role != Role.IN_PROGRESS, Account.is_delete == False).first() is not None:
+    if not data.id_card_link.startswith(f"{user_id}_") or not (UPLOAD_DIR / data.id_card_link).is_file():
+        raise APIException(400, "10020", "invalid id card link")
+    if Account.campus_id_taken(db, data.campus_id):
         raise APIException(400, "10012", "the same campus id")
     user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
     if user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
         raise APIException(400, "10008", "permission denied")
+    # 同一時間只保留一筆待審核的變更申請，新的取代舊的
+    db.query(VerifiedInProgress).filter(
+        VerifiedInProgress.user_id == user_id,
+        VerifiedInProgress.is_ver == False,
+        VerifiedInProgress.is_delete == False,
+    ).update({VerifiedInProgress.is_delete: True}, synchronize_session=False)
     new_ver = VerifiedInProgress(
         campus_id=data.campus_id,
         user_id=user_id,
@@ -116,6 +127,15 @@ def my_group(request: Request, db: Session = Depends(get_db)) -> dict:
     if user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
         raise APIException(400, "10008", "permission denied")
     group_list = user.group_list
+    if not group_list:
+        return APIResponse(
+            status_code="00000",
+            message="success",
+            response_datetime=datetime.now(),
+            verified_groups=[],
+            in_progress_groups=[],
+            unverified_groups=[],
+        )
     groups = db.query(Group).filter(Group.group_id.in_(group_list)).all()
     verified_group = []
     in_progress_group = []
@@ -132,7 +152,7 @@ def my_group(request: Request, db: Session = Depends(get_db)) -> dict:
         status_code="00000",
         message="success",
         response_datetime=datetime.now(),
-        verified_group=[
+        verified_groups=[
             {
                 "group_id": vg.group_id,
                 "title": vg.title,
@@ -142,7 +162,7 @@ def my_group(request: Request, db: Session = Depends(get_db)) -> dict:
             }
             for vg in verified_group
         ],
-        in_progress_group=[
+        in_progress_groups=[
             {
                 "group_id": ipg.group_id,
                 "title": ipg.title,
@@ -152,13 +172,14 @@ def my_group(request: Request, db: Session = Depends(get_db)) -> dict:
             }
             for ipg in in_progress_group
         ],
-        unverified_group=[
+        unverified_groups=[
             {
                 "group_id": uvg.group_id,
                 "title": uvg.title,
                 "desc": uvg.desc,
                 "begin": uvg.begin,
-                "end": uvg.end
+                "end": uvg.end,
+                "reason": uvg.reason
             }
             for uvg in unverified_group
         ],
@@ -173,8 +194,6 @@ def my_profile(request: Request, db: Session = Depends(get_db)) -> dict:
     user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
-    if user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
-        raise APIException(400, "10008", "permission denied")
 
     return APIResponse(
         status_code="00000",
@@ -183,5 +202,6 @@ def my_profile(request: Request, db: Session = Depends(get_db)) -> dict:
         user_id=user.user_id,
         campus_id=user.campus_id,
         email=user.email,
-        name=user.name
+        name=user.name,
+        role=user.role.value
     )

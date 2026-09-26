@@ -15,16 +15,31 @@ class APIResponse(BaseModel):
     campus_id: Optional[str] = None
     email: Optional[str] = None
     name: Optional[str] = None
-    verified_group: Optional[list] = None
-    in_progress_group: Optional[list] = None
-    unverified_group: Optional[list] = None
-    group_leader: Optional[list] = None
-    group_member: Optional[list] = None
+    role: Optional[str] = None
+    users: Optional[list] = None
+    id_card_link: Optional[str] = None
+    agree_groups: Optional[list] = None
+    in_progress_groups: Optional[list] = None
+    disagree_groups: Optional[list] = None
+    verified_groups: Optional[list] = None
+    unverified_groups: Optional[list] = None
+    status: Optional[str] = None
+    reason: Optional[str] = None
+    group_id: Optional[str] = None
+    title: Optional[str] = None
+    desc: Optional[str] = None
+    begin: Optional[datetime] = None
+    end: Optional[datetime] = None
+    group_leaders: Optional[list] = None
+    group_members: Optional[list] = None
+    group_role: Optional[str] = None
     admin: Optional[list] = None
     db_editor: Optional[list] = None
     verified_user: Optional[list] = None
     in_progress_user: Optional[list] = None
     unverified_user: Optional[list] = None
+    change_request_user: Optional[list] = None
+    change_request: Optional[dict] = None
     
 
 # 錯誤回應的格式 
