@@ -3,8 +3,7 @@ from datetime import datetime
 from typing import Optional
 
 class InviteRequest(BaseModel):
-    campus_id: str
-    is_leader: bool
+    user_id: str
 
 class ChangeRoleRequest(BaseModel):
     user_id: str
