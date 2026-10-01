@@ -10,3 +10,10 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
     name: str
+
+class ChangeEmailRequest(BaseModel):
+    email: str
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str

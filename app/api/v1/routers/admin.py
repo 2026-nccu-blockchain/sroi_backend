@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Request, Depends
+from fastapi.responses import FileResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from app.db.session import get_db
@@ -7,11 +8,29 @@ from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
-# from app.schemas.admin import (
-# )
+from app.api.v1.routers.upload import MEDIA_TYPES
+from app.schemas.admin import (
+    UnconfirmGroupRequest
+)
 import re
+from pathlib import Path
 
 router = APIRouter()
+
+UPLOAD_DIR = (Path(__file__).resolve().parents[3] / "uploads" / "images").resolve()
+
+
+def latest_change_request(db: Session, user_id: str):
+    return db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == user_id, VerifiedInProgress.is_ver == False, VerifiedInProgress.is_delete == False).order_by(VerifiedInProgress.create_time.desc()).first()
+
+
+def latest_change_requests(db: Session) -> dict:
+    # 每位使用者只取最新一筆待審核的學號變更申請
+    pending = db.query(VerifiedInProgress).filter(VerifiedInProgress.is_ver == False, VerifiedInProgress.is_delete == False).order_by(VerifiedInProgress.create_time.desc()).all()
+    latest = {}
+    for v in pending:
+        latest.setdefault(v.user_id, v)
+    return latest
 
 
 @router.post("/confirm_verification/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
@@ -30,6 +49,9 @@ def confirm_verification(request: Request, UserId: str, db: Session = Depends(ge
     verification = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == True, VerifiedInProgress.is_delete == False).first()
     if verification is None:
         raise APIException(404, "10001", "user not found")
+    # 送出申請後學號可能已被其他帳號審核通過
+    if Account.campus_id_taken(db, verification.campus_id):
+        raise APIException(400, "10012", "the same campus id")
     user.role = Role.VERIFIED
     user.campus_id = verification.campus_id
     user.id_card_link = verification.id_card_link
@@ -83,12 +105,18 @@ def confirm_change(request: Request, UserId: str, db: Session = Depends(get_db))
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None or user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
         raise APIException(404, "10001", "user not found")
-    verification = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == False, VerifiedInProgress.is_delete == False).first()
-    if verification is None:
+    # 舊資料可能有多筆待審核，以最新一筆為準，其餘一併結案
+    verifications = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == False, VerifiedInProgress.is_delete == False).order_by(VerifiedInProgress.create_time.desc()).all()
+    if not verifications:
         raise APIException(404, "10001", "user not found")
+    verification = verifications[0]
+    # 送出申請後學號可能已被其他帳號審核通過
+    if Account.campus_id_taken(db, verification.campus_id, exclude_user_id=UserId):
+        raise APIException(400, "10012", "the same campus id")
     user.campus_id = verification.campus_id
     user.id_card_link = verification.id_card_link
-    verification.is_delete = True
+    for v in verifications:
+        v.is_delete = True
     db.commit()
 
     return APIResponse(
@@ -111,10 +139,11 @@ def unconfirm_change(request: Request, UserId: str, db: Session = Depends(get_db
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None or user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
         raise APIException(404, "10001", "user not found")
-    verification = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == False, VerifiedInProgress.is_delete == False).first()
-    if verification is None:
+    verifications = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == False, VerifiedInProgress.is_delete == False).all()
+    if not verifications:
         raise APIException(404, "10001", "user not found")
-    verification.is_delete = True
+    for v in verifications:
+        v.is_delete = True
     db.commit()
 
     return APIResponse(
@@ -154,7 +183,7 @@ def confirm_group(request: Request, GroupId: str, db: Session = Depends(get_db))
 
 
 @router.post("/unconfirm_group/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
-def unconfirm_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+def unconfirm_group(request: Request, GroupId: str, data: UnconfirmGroupRequest, db: Session = Depends(get_db)) -> dict:
     verify_token(request)
     payload = return_payload(request)
     admin_id = payload["user_id"]
@@ -167,6 +196,7 @@ def unconfirm_group(request: Request, GroupId: str, db: Session = Depends(get_db
     if group is None:
         raise APIException(404, "10013", "group not found")
     group.status = Role.UNVERIFIED
+    group.reason = data.reason
     db.commit()
 
     return APIResponse(
@@ -203,7 +233,13 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             in_progress_user.append(user)
         elif user.role == Role.UNVERIFIED:
             unverified_user.append(user)
-    
+    # 學號變更申請不影響角色，使用者同時也會出現在原本的角色清單
+    change_requests = latest_change_requests(db)
+    change_request_user = [
+        user for user in all_user
+        if user.user_id in change_requests and user.role in (Role.ADMIN, Role.DB_EDITOR, Role.VERIFIED)
+    ]
+
     return APIResponse(
         status_code="00000",
         message="success",
@@ -248,7 +284,198 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             }
             for uvu in unverified_user
         ],
+        change_request_user=[
+            {
+                "user_id": cru.user_id,
+                "campus_id": cru.campus_id,
+                "name": cru.name,
+                "new_campus_id": change_requests[cru.user_id].campus_id
+            }
+            for cru in change_request_user
+        ],
     )
+
+
+@router.get("/one_user/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def show_one_user(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    if user.role == Role.ADMIN or user.role == Role.DB_EDITOR or user.role == Role.VERIFIED:
+        change = latest_change_request(db, UserId)
+        return APIResponse(
+            status_code="00000",
+            message="success",
+            response_datetime=datetime.now(),
+            user_id=user.user_id,
+            campus_id=user.campus_id,
+            name=user.name,
+            email=user.email,
+            role=user.role.value,
+            id_card_link=user.id_card_link,
+            change_request={
+                "campus_id": change.campus_id,
+                "id_card_link": change.id_card_link,
+                "create_time": change.create_time
+            } if change else None
+        )
+    elif user.role == Role.IN_PROGRESS:
+        progress = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_ver == True, VerifiedInProgress.is_delete == False).first()
+        if progress is None:
+            raise APIException(404, "10001", "user not found")
+        return APIResponse(
+            status_code="00000",
+            message="success",
+            response_datetime=datetime.now(),
+            user_id=user.user_id,
+            campus_id=progress.campus_id,
+            name=user.name,
+            email=user.email,
+            role=user.role.value,
+            id_card_link=progress.id_card_link
+        )
+    # 未驗證：沒有學號和照片
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        user_id=user.user_id,
+        name=user.name,
+        email=user.email,
+        role=user.role.value,
+    )
+
+
+@router.get("/all_groups", response_model=APIResponse, response_model_exclude_none=True)
+def show_all_groups(request: Request, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")    
+    all_groups = db.query(Group).filter(Group.is_delete == False).all()
+    agree_groups = []
+    in_progress_groups = []
+    disagree_groups = []
+    for group in all_groups:
+        if group.status == Role.VERIFIED:
+            agree_groups.append(group)
+        elif group.status == Role.IN_PROGRESS:
+            in_progress_groups.append(group)
+        elif group.status == Role.UNVERIFIED:
+            disagree_groups.append(group)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        agree_groups=[
+            {
+                "group_id": ag.group_id,
+                "title": ag.title,
+                "desc": ag.desc,
+                "begin": ag.begin,
+                "end": ag.end
+            }
+            for ag in agree_groups
+        ],
+        in_progress_groups=[
+            {
+                "group_id": ipg.group_id,
+                "title": ipg.title,
+                "desc": ipg.desc,
+                "begin": ipg.begin,
+                "end": ipg.end
+            }
+            for ipg in in_progress_groups
+        ],
+        disagree_groups=[
+            {
+                "group_id": dg.group_id,
+                "title": dg.title,
+                "desc": dg.desc,
+                "begin": dg.begin,
+                "end": dg.end,
+                "reason": dg.reason
+            }
+            for dg in disagree_groups
+        ],
+    )
+
+
+@router.get("/one_group/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def show_one_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    # 管理員可以看任何狀態的群組
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    group_leaders = db.query(Account).filter(Account.user_id.in_(group.leader_list or []), Account.is_delete == False).all()
+    group_members = db.query(Account).filter(Account.user_id.in_(group.member_list or []), Account.is_delete == False).all()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        group_id=group.group_id,
+        title=group.title,
+        desc=group.desc,
+        begin=group.begin,
+        end=group.end,
+        status=group.status.value,
+        reason=group.reason,
+        group_leaders=[
+            {
+                "user_id": gl.user_id,
+                "campus_id": gl.campus_id,
+                "name": gl.name
+            }
+            for gl in group_leaders
+        ],
+        group_members=[
+            {
+                "user_id": gm.user_id,
+                "campus_id": gm.campus_id,
+                "name": gm.name
+            }
+            for gm in group_members
+        ],
+    )
+
+
+@router.get("/id_card/{filename}")
+def get_id_card(request: Request, filename: str, db: Session = Depends(get_db)):
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    # 防止 ../ 讀到上傳資料夾以外的檔案
+    path = (UPLOAD_DIR / filename).resolve()
+    if path.parent != UPLOAD_DIR or not path.is_file():
+        raise APIException(404, "10021", "image not found")
+    return FileResponse(path, media_type=MEDIA_TYPES.get(path.suffix, "application/octet-stream"))
 
 
 @router.post("/add_db_editor/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
@@ -331,6 +558,9 @@ def remove_admin(request: Request, UserId: str, db: Session = Depends(get_db)) -
         raise APIException(404, "10001", "user not found")
     if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
+    # 不能移除自己，確保系統至少保留一位管理員
+    if UserId == admin_id:
+        raise APIException(400, "10015", "can't change own permissions")
     user = db.query(Account).filter(Account.user_id == UserId, Account.role == Role.ADMIN, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
@@ -354,6 +584,8 @@ def delete_user(request: Request, UserId: str, db: Session = Depends(get_db)) ->
         raise APIException(404, "10001", "user not found")
     if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
+    if UserId == admin_id:
+        raise APIException(400, "10015", "can't change own permissions")
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
@@ -364,4 +596,32 @@ def delete_user(request: Request, UserId: str, db: Session = Depends(get_db)) ->
         status_code="00000",
         message="success",
         response_datetime=datetime.now(),
+    )
+
+
+@router.get("/search_user", response_model=APIResponse, response_model_exclude_none=True)
+def group_search_user(request: Request, Search: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    admin_id = payload["user_id"]
+    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
+    if admin is None:
+        raise APIException(404, "10001", "user not found")
+    if admin.role != Role.ADMIN:
+        raise APIException(400, "10008", "permission denied")
+    users = db.query(Account).filter(or_(Account.campus_id.ilike(f"%{Search}%"), Account.name.ilike(f"%{Search}%")), 
+                                     Account.role != Role.UNVERIFIED, Account.role != Role.IN_PROGRESS, Account.is_delete == False).all()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        users=[
+            {
+                "user_id": user.user_id,
+                "campus_id": user.campus_id,
+                "name": user.name
+            }
+            for user in users
+        ],
     )
