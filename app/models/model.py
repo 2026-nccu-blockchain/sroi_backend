@@ -51,7 +51,7 @@ class Account(Base):
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
-    # forms = relationship("Form", back_populates="author")
+    projects = relationship("Project", back_populates="owner")
 
     def set_password(self, password: str) -> None:
         salt = bcrypt.gensalt()
@@ -146,6 +146,48 @@ class Form(Base):
     answers = relationship("Answer", back_populates="form")
 
     responses = relationship("FormResponse", back_populates="form", cascade="all, delete-orphan")
+    linked_projects = relationship("Project", back_populates="linked_form")
+
+
+class Project(Base):
+    __tablename__ = "projects"
+
+    project_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    owner_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False, index=True)
+    linked_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)
+    name = Column(String(255), nullable=False)
+    organization = Column(String(255), nullable=False, default="")
+    description = Column(Text, nullable=False, default="")
+    year = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default="draft")
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    owner = relationship("Account", back_populates="projects")
+    linked_form = relationship("Form", back_populates="linked_projects")
+    stakeholders = relationship(
+        "ProjectStakeholder",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectStakeholder.position",
+    )
+
+
+class ProjectStakeholder(Base):
+    __tablename__ = "project_stakeholders"
+
+    stakeholder_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    role = Column(String(100), nullable=False, default="")
+    email = Column(String(255), nullable=True)
+    notes = Column(Text, nullable=False, default="")
+    position = Column(Integer, nullable=False, default=0)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    project = relationship("Project", back_populates="stakeholders")
 
 
 class Page(Base):
