@@ -2,6 +2,8 @@ from datetime import datetime, timedelta, timezone
 import secrets
 
 from fastapi import APIRouter, Depends, status, Request
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
@@ -35,6 +37,8 @@ from app.schemas.form import (
     QuestionCreate,
     QuestionRead,
     QuestionUpdate,
+    RespondentEmailAvailability,
+    RespondentEmailCheck,
 )
 
 router = APIRouter()
@@ -510,6 +514,31 @@ def _serialize_response(response: FormResponse) -> FormResponseRead:
     )
 
 
+@router.post(
+    "/public/{public_token}/responses/check-email",
+    response_model=RespondentEmailAvailability,
+)
+def check_response_email(
+    public_token: str,
+    data: RespondentEmailCheck,
+    db: Session = Depends(get_db),
+) -> RespondentEmailAvailability:
+    form = db.query(Form.form_id).filter(
+        Form.public_token == public_token,
+        Form.status == FormStatus.PUBLISHED,
+        Form.is_delete.is_(False),
+    ).first()
+    if form is None:
+        raise APIException(404, "20001", "Published form not found")
+
+    respondent_email = str(data.respondent_email).strip().lower()
+    existing_response = db.query(FormResponse.response_id).filter(
+        FormResponse.form_id == form.form_id,
+        func.lower(FormResponse.respondent_email) == respondent_email,
+    ).first()
+    return RespondentEmailAvailability(can_submit=existing_response is None)
+
+
 @router.post("/public/{public_token}/responses", response_model=FormResponseRead, status_code=status.HTTP_201_CREATED)
 def submit_response(
     public_token: str,
@@ -525,6 +554,14 @@ def submit_response(
     ).first()
     if form is None:
         raise APIException(404, "20001", "Published form not found")
+
+    respondent_email = str(data.respondent_email).strip().lower()
+    existing_response = db.query(FormResponse.response_id).filter(
+        FormResponse.form_id == form.form_id,
+        func.lower(FormResponse.respondent_email) == respondent_email,
+    ).first()
+    if existing_response is not None:
+        raise APIException(409, "20016", "這個 Email 已填寫過此表單")
 
     submitted = {item.question_id: item for item in data.answers}
     if len(submitted) != len(data.answers):
@@ -557,7 +594,7 @@ def submit_response(
 
     response = FormResponse(
         form=form,
-        respondent_email=str(data.respondent_email),
+        respondent_email=respondent_email,
         status=ResponseStatus.SUBMITTED,
         submitted_at=datetime.now(timezone.utc),
     )
@@ -579,7 +616,11 @@ def submit_response(
         response.answers.append(answer)
 
     db.add(response)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise APIException(409, "20016", "這個 Email 已填寫過此表單") from error
     response = db.query(FormResponse).options(
         selectinload(FormResponse.answers).selectinload(Answer.selected_options)
     ).filter(FormResponse.response_id == response.response_id).one()

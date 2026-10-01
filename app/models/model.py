@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Date, DateTime, Boolean, ForeignKey, Enum as SQLEnum, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Text, Date, DateTime, Boolean, ForeignKey, Enum as SQLEnum, Index, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -290,6 +290,15 @@ class QuestionOption(Base):
 
 class FormResponse(Base):
     __tablename__ = "form_responses"
+    __table_args__ = (
+        Index(
+            "uq_form_response_email",
+            "form_id",
+            "respondent_email",
+            unique=True,
+            postgresql_where=text("is_duplicate_legacy = false"),
+        ),
+    )
 
     response_id = Column(String(36),primary_key=True,index=True,nullable=False,default=lambda: str(uuid.uuid4()))
     form_id = Column(String(36),ForeignKey("forms.form_id", ondelete="CASCADE"),nullable=False,index=True)
@@ -297,6 +306,7 @@ class FormResponse(Base):
     status = Column(SQLEnum(ResponseStatus),nullable=False,default=ResponseStatus.DRAFT)
     started_at = Column(DateTime(timezone=True),server_default=func.now(),nullable=False)
     submitted_at = Column(DateTime(timezone=True))
+    is_duplicate_legacy = Column(Boolean, nullable=False, default=False, server_default="false")
     form = relationship("Form",back_populates="responses")
     answers = relationship("Answer",back_populates="response",cascade="all, delete-orphan")
 
