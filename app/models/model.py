@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Date, DateTime, Boolean, ForeignKey, Enum as SQLEnum, Index, UniqueConstraint, text
+from sqlalchemy import Column, Integer, Numeric, String, Text, Date, DateTime, Boolean, ForeignKey, Enum as SQLEnum, Index, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -132,6 +132,7 @@ class Form(Base):
     form_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     public_token = Column(String(32), unique=True, index=True)
     author_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False)
+    project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=True, index=True)
     title = Column(String(255))
     content = Column(Text)
     status = Column(SQLEnum(FormStatus), nullable=False, default=FormStatus.DRAFT)
@@ -146,7 +147,12 @@ class Form(Base):
     answers = relationship("Answer", back_populates="form")
 
     responses = relationship("FormResponse", back_populates="form", cascade="all, delete-orphan")
-    linked_projects = relationship("Project", back_populates="linked_form")
+    project = relationship("Project", back_populates="forms", foreign_keys=[project_id])
+    linked_projects = relationship(
+        "Project",
+        back_populates="linked_form",
+        foreign_keys="Project.linked_form_id",
+    )
 
 
 class Project(Base):
@@ -158,6 +164,7 @@ class Project(Base):
     name = Column(String(255), nullable=False)
     organization = Column(String(255), nullable=False, default="")
     description = Column(Text, nullable=False, default="")
+    actual_input_cost = Column(Numeric(14, 2), nullable=False, default=0)
     year = Column(Integer, nullable=False)
     status = Column(String(20), nullable=False, default="draft")
     is_delete = Column(Boolean, nullable=False, default=False)
@@ -165,12 +172,34 @@ class Project(Base):
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     owner = relationship("Account", back_populates="projects")
-    linked_form = relationship("Form", back_populates="linked_projects")
+    linked_form = relationship(
+        "Form",
+        back_populates="linked_projects",
+        foreign_keys=[linked_form_id],
+    )
+    forms = relationship(
+        "Form",
+        back_populates="project",
+        foreign_keys="Form.project_id",
+        order_by="Form.create_time.desc()",
+    )
     stakeholders = relationship(
         "ProjectStakeholder",
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="ProjectStakeholder.position",
+    )
+    outcomes = relationship(
+        "ProjectOutcome",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectOutcome.position",
+    )
+    interview_files = relationship(
+        "ProjectInterviewFile",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectInterviewFile.create_time",
     )
 
 
@@ -190,6 +219,34 @@ class ProjectStakeholder(Base):
     project = relationship("Project", back_populates="stakeholders")
 
 
+class ProjectOutcome(Base):
+    __tablename__ = "project_outcomes"
+
+    outcome_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    position = Column(Integer, nullable=False, default=0)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    project = relationship("Project", back_populates="outcomes")
+    form_pages = relationship("Page", back_populates="project_outcome")
+
+
+class ProjectInterviewFile(Base):
+    __tablename__ = "project_interview_files"
+
+    file_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    original_name = Column(String(255), nullable=False)
+    stored_name = Column(String(255), nullable=False, unique=True)
+    content_type = Column(String(100), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+
+    project = relationship("Project", back_populates="interview_files")
+
+
 class Page(Base):
     __tablename__ = "pages"
 
@@ -205,6 +262,12 @@ class Page(Base):
         ForeignKey("forms.form_id"),
         nullable=False,
     )
+    project_outcome_id = Column(
+        String(36),
+        ForeignKey("project_outcomes.outcome_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     title = Column(String(255))
     content = Column(Text, nullable=False)
     position = Column(Integer, nullable=False, default=0)
@@ -216,6 +279,7 @@ class Page(Base):
         "Form",
         back_populates="pages",
     )
+    project_outcome = relationship("ProjectOutcome", back_populates="form_pages")
 
     questions = relationship(
         "Question",

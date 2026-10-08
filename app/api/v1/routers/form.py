@@ -17,6 +17,8 @@ from app.models.model import (
     FormResponse,
     FormStatus,
     Page,
+    Project,
+    ProjectOutcome,
     Question,
     QuestionOption,
     QuestionType,
@@ -60,6 +62,37 @@ def _owned_form(db: Session, form_id: str, user_id: str) -> Form:
     if form is None:
         raise APIException(404, "20001", "Form not found")
     return form
+
+
+def _owned_project(db: Session, project_id: str, user_id: str) -> Project:
+    project = db.query(Project).filter(
+        Project.project_id == project_id,
+        Project.owner_id == user_id,
+        Project.is_delete.is_(False),
+    ).first()
+    if project is None:
+        raise APIException(404, "30001", "Project not found")
+    return project
+
+
+def _validate_project_outcome(
+    db: Session,
+    outcome_id: str | None,
+    user_id: str,
+    project_id: str | None = None,
+) -> None:
+    if outcome_id is None:
+        return
+    query = db.query(ProjectOutcome.outcome_id).join(Project).filter(
+        ProjectOutcome.outcome_id == outcome_id,
+        Project.owner_id == user_id,
+        Project.is_delete.is_(False),
+    )
+    if project_id is not None:
+        query = query.filter(ProjectOutcome.project_id == project_id)
+    exists = query.first()
+    if exists is None:
+        raise APIException(400, "30003", "Project outcome does not belong to this user")
 
 
 def _form_query(db: Session):
@@ -168,8 +201,11 @@ def create_form(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Form:
+    user_id = _user_id(payload)
+    _owned_project(db, data.project_id, user_id)
     form = Form(
-        author_id=_user_id(payload),
+        author_id=user_id,
+        project_id=data.project_id,
         title=data.title,
         content=data.content,
         status=data.status,
@@ -177,7 +213,9 @@ def create_form(
     if data.status == FormStatus.PUBLISHED:
         _ensure_public_token(form)
     for page_data in data.pages:
+        _validate_project_outcome(db, page_data.project_outcome_id, user_id, data.project_id)
         page = Page(
+            project_outcome_id=page_data.project_outcome_id,
             title=page_data.title,
             content=page_data.content,
             position=page_data.position,
@@ -324,8 +362,16 @@ def create_page(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Page:
-    form = _owned_form(db, form_id, _user_id(payload))
-    page = Page(form=form, title=data.title, content=data.content, position=data.position)
+    user_id = _user_id(payload)
+    form = _owned_form(db, form_id, user_id)
+    _validate_project_outcome(db, data.project_outcome_id, user_id, form.project_id)
+    page = Page(
+        form=form,
+        project_outcome_id=data.project_outcome_id,
+        title=data.title,
+        content=data.content,
+        position=data.position,
+    )
     for question_data in data.questions:
         _add_question(form, page, question_data)
     db.add(page)
@@ -341,15 +387,19 @@ def update_page(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Page:
+    user_id = _user_id(payload)
     page = db.query(Page).join(Form).filter(
         Page.page_id == page_id,
         Page.is_delete.is_(False),
-        Form.author_id == _user_id(payload),
+        Form.author_id == user_id,
         Form.is_delete.is_(False),
     ).first()
     if page is None:
         raise APIException(404, "20002", "Page not found")
-    for field, value in data.model_dump(exclude_unset=True).items():
+    changes = data.model_dump(exclude_unset=True)
+    if "project_outcome_id" in changes:
+        _validate_project_outcome(db, changes["project_outcome_id"], user_id, page.form.project_id)
+    for field, value in changes.items():
         setattr(page, field, value)
     db.commit()
     db.refresh(page)

@@ -85,6 +85,7 @@ class QuestionRead(ORMModel):
 
 
 class PageCreate(BaseModel):
+    project_outcome_id: Optional[str] = None
     title: Optional[str] = Field(default=None, max_length=255)
     content: str = ""
     position: int = Field(default=0, ge=0)
@@ -92,6 +93,7 @@ class PageCreate(BaseModel):
 
 
 class PageUpdate(BaseModel):
+    project_outcome_id: Optional[str] = None
     title: Optional[str] = Field(default=None, max_length=255)
     content: Optional[str] = None
     position: Optional[int] = Field(default=None, ge=0)
@@ -99,6 +101,7 @@ class PageUpdate(BaseModel):
 
 class PageRead(ORMModel):
     page_id: str
+    project_outcome_id: Optional[str]
     title: Optional[str]
     content: str
     position: int
@@ -106,6 +109,7 @@ class PageRead(ORMModel):
 
 
 class FormCreate(BaseModel):
+    project_id: str
     title: str = Field(min_length=1, max_length=255)
     content: str = ""
     status: FormStatus = FormStatus.DRAFT
@@ -129,6 +133,7 @@ class FormStructureSave(BaseModel):
 
 class FormRead(ORMModel):
     form_id: str
+    project_id: Optional[str]
     public_token: Optional[str]
     author_id: str
     title: Optional[str]
