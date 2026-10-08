@@ -405,3 +405,32 @@ class AnswerChoice(Base):
 
     answer = relationship("Answer", back_populates="selected_options")
     option = relationship("QuestionOption", back_populates="answer_choices")
+
+from sqlalchemy import Numeric
+
+
+class FinancialProxy(Base):
+    __tablename__ = "financial_proxies"
+
+    proxy_id = Column(
+        String(36),
+        primary_key=True,
+        default=lambda: str(uuid.uuid4()),
+    )
+
+    name = Column(String(255), nullable=False)
+    value = Column(Numeric(18, 4), nullable=False)
+    note = Column(Text, nullable=False, default="")
+
+    created_by = Column(
+        String(36),
+        ForeignKey("accounts.user_id"),
+        nullable=False,
+        index=True,
+    )
+
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
