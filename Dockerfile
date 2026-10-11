@@ -14,4 +14,5 @@ COPY alembic.ini ./alembic.ini
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# --proxy-headers：信任 nginx 傳來的真實 IP，RateLimit 才不會把所有人算成同一個 IP
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"]
