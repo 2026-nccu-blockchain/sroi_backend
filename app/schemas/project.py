@@ -14,7 +14,6 @@ class ORMModel(BaseModel):
 class StakeholderInput(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     role: str = Field(default="", max_length=100)
-    email: Optional[EmailStr] = None
     notes: str = ""
 
 
@@ -22,7 +21,6 @@ class StakeholderRead(ORMModel):
     stakeholder_id: str
     name: str
     role: str
-    email: Optional[str]
     notes: str
     position: int
 
