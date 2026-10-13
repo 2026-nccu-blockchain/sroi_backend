@@ -1,9 +1,10 @@
 import io
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
-from fastapi import APIRouter, Depends, File, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form as FormField, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload, with_loader_criteria
 from starlette.concurrency import run_in_threadpool
@@ -31,10 +32,11 @@ def _user_id(payload: dict) -> str:
 
 def _project_query(db: Session):
     return db.query(Project).options(
-        selectinload(Project.stakeholders),
+        selectinload(Project.stakeholders).selectinload(ProjectStakeholder.pre_form),
+        selectinload(Project.stakeholders).selectinload(ProjectStakeholder.post_form),
+        selectinload(Project.stakeholders).selectinload(ProjectStakeholder.interview_files),
         selectinload(Project.outcomes),
         selectinload(Project.interview_files),
-        selectinload(Project.linked_form),
         selectinload(Project.forms),
         with_loader_criteria(Form, Form.is_delete.is_(False)),
         with_loader_criteria(ProjectStakeholder, ProjectStakeholder.is_delete.is_(False)),
@@ -54,16 +56,48 @@ def _owned_project(db: Session, project_id: str, owner_id: str) -> Project:
     return project
 
 
-def _validate_linked_form(db: Session, form_id: str | None, owner_id: str) -> None:
-    if form_id is None:
+def _validate_stakeholder_forms(
+    db: Session,
+    items: list[StakeholderInput],
+    owner_id: str,
+    project_id: str | None = None,
+) -> None:
+    """前測、後測表單必須是自己的、未刪除，且沒有綁到其他專案。"""
+    form_ids = {
+        form_id
+        for item in items
+        for form_id in (item.pre_form_id, item.post_form_id)
+        if form_id is not None
+    }
+    if not form_ids:
         return
-    exists = db.query(Form.form_id).filter(
-        Form.form_id == form_id,
+    query = db.query(Form.form_id).filter(
+        Form.form_id.in_(form_ids),
         Form.author_id == owner_id,
         Form.is_delete.is_(False),
+    )
+    if project_id is None:
+        query = query.filter(Form.project_id.is_(None))
+    else:
+        query = query.filter((Form.project_id.is_(None)) | (Form.project_id == project_id))
+    valid_ids = {form_id for (form_id,) in query.all()}
+    if valid_ids != form_ids:
+        raise APIException(400, "30002", "Linked form does not belong to this project")
+
+
+def _as_aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def _owned_stakeholder(db: Session, project_id: str, stakeholder_id: str) -> ProjectStakeholder:
+    stakeholder = db.query(ProjectStakeholder).filter(
+        ProjectStakeholder.stakeholder_id == stakeholder_id,
+        ProjectStakeholder.project_id == project_id,
+        ProjectStakeholder.is_delete.is_(False),
     ).first()
-    if exists is None:
-        raise APIException(400, "30002", "Linked form does not belong to this user")
+    if stakeholder is None:
+        raise APIException(404, "30007", "利害關係人不存在")
+    return stakeholder
 
 
 def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> None:
@@ -80,6 +114,8 @@ def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> No
         stakeholder.name = item.name
         stakeholder.role = item.role
         stakeholder.notes = item.notes
+        stakeholder.pre_form_id = item.pre_form_id
+        stakeholder.post_form_id = item.post_form_id
         stakeholder.position = position
     for stakeholder in existing.values():
         stakeholder.is_delete = True
@@ -196,16 +232,16 @@ def create_project(
     payload: dict = Depends(return_payload),
 ) -> Project:
     owner_id = _user_id(payload)
-    _validate_linked_form(db, data.linked_form_id, owner_id)
+    _validate_stakeholder_forms(db, data.stakeholders, owner_id)
     project = Project(
         owner_id=owner_id,
         name=data.name,
         organization=data.organization,
         description=data.description,
         actual_input_cost=data.actual_input_cost,
-        year=data.year,
+        begin=data.begin,
+        end=data.end,
         status=data.status,
-        linked_form_id=data.linked_form_id,
     )
     _replace_stakeholders(project, data.stakeholders)
     _replace_outcomes(project, data.outcomes)
@@ -236,12 +272,14 @@ def update_project(
     changes = data.model_dump(exclude_unset=True)
     stakeholders = changes.pop("stakeholders", None)
     outcomes = changes.pop("outcomes", None)
-    if "linked_form_id" in changes:
-        _validate_linked_form(db, changes["linked_form_id"], owner_id)
     for field, value in changes.items():
         setattr(project, field, value)
+    if _as_aware(project.end) < _as_aware(project.begin):
+        raise APIException(400, "30008", "結束時間不可早於開始時間")
     if stakeholders is not None:
-        _replace_stakeholders(project, [StakeholderInput(**item) for item in stakeholders])
+        stakeholder_items = [StakeholderInput(**item) for item in stakeholders]
+        _validate_stakeholder_forms(db, stakeholder_items, owner_id, project_id)
+        _replace_stakeholders(project, stakeholder_items)
     if outcomes is not None:
         _replace_outcomes(
             project,
@@ -268,11 +306,13 @@ def delete_project(
 @router.post("/{project_id}/interview-files", response_model=InterviewFileRead, status_code=status.HTTP_201_CREATED)
 async def upload_interview_file(
     project_id: str,
+    stakeholder_id: str = FormField(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> ProjectInterviewFile:
     project = _owned_project(db, project_id, _user_id(payload))
+    stakeholder = _owned_stakeholder(db, project_id, stakeholder_id)
     data = await _read_interview_file(file)
     detected = _detect_interview_type(data)
     if detected is None:
@@ -283,6 +323,7 @@ async def upload_interview_file(
     await run_in_threadpool((INTERVIEW_UPLOAD_DIR / stored_name).write_bytes, data)
     record = ProjectInterviewFile(
         project=project,
+        stakeholder=stakeholder,
         original_name=original_name,
         stored_name=stored_name,
         content_type=content_type,

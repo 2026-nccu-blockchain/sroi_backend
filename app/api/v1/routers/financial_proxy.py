@@ -20,7 +20,7 @@ class ProxyCreate(BaseModel):
 
 
 class ProxyRead(ProxyCreate):
-    id: int
+    proxy_id: str
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -30,8 +30,9 @@ def list_proxies(
     payload: dict = Depends(return_payload),
 ):
     return db.query(FinancialProxy).filter(
-        FinancialProxy.owner_id == str(payload["user_id"])
-    ).order_by(FinancialProxy.id.desc()).all()
+        FinancialProxy.created_by == str(payload["user_id"]),
+        FinancialProxy.is_delete.is_(False),
+    ).order_by(FinancialProxy.create_time.desc()).all()
 
 
 @router.post("", response_model=ProxyRead, status_code=status.HTTP_201_CREATED)
@@ -41,7 +42,7 @@ def create_proxy(
     payload: dict = Depends(return_payload),
 ):
     item = FinancialProxy(
-        owner_id=str(payload["user_id"]),
+        created_by=str(payload["user_id"]),
         name=data.name,
         value=data.value,
         note=data.note,

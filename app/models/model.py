@@ -142,10 +142,15 @@ class Form(Base):
 
     responses = relationship("FormResponse", back_populates="form")
     project = relationship("Project", back_populates="forms", foreign_keys=[project_id])
-    linked_stakeholders = relationship(
+    pre_test_stakeholders = relationship(
         "ProjectStakeholder",
-        back_populates="linked_form",
-        foreign_keys="ProjectStakeholder.linked_form_id",
+        back_populates="pre_form",
+        foreign_keys="ProjectStakeholder.pre_form_id",
+    )
+    post_test_stakeholders = relationship(
+        "ProjectStakeholder",
+        back_populates="post_form",
+        foreign_keys="ProjectStakeholder.post_form_id",
     )
 
 
@@ -158,8 +163,9 @@ class Project(Base):
     organization = Column(String(255), nullable=False, default="")
     description = Column(Text, nullable=False, default="")
     actual_input_cost = Column(Numeric(14, 2), nullable=False, default=0)
-    begin = Column(DateTime(timezone=True), nullable=False, default="")
-    end = Column(DateTime(timezone=True), nullable=False, default="")
+    begin = Column(DateTime(timezone=True), nullable=False)
+    end = Column(DateTime(timezone=True), nullable=False)
+    sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
     status = Column(String(20), nullable=False, default="draft")
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -187,6 +193,7 @@ class Project(Base):
         back_populates="project",
         order_by="ProjectInterviewFile.create_time",
     )
+    outcome_valuations = relationship("ProjectOutcomeValuation", back_populates="project")
 
 
 class ProjectStakeholder(Base):
@@ -197,17 +204,23 @@ class ProjectStakeholder(Base):
     name = Column(String(255), nullable=False)
     role = Column(String(100), nullable=False, default="")
     notes = Column(Text, nullable=False, default="")
-    linked_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)
+    pre_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 前測表單
+    post_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 後測表單
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     project = relationship("Project", back_populates="stakeholders")
-    linked_form = relationship(
+    pre_form = relationship(
         "Form",
-        back_populates="linked_stakeholders",
-        foreign_keys=[linked_form_id],
+        back_populates="pre_test_stakeholders",
+        foreign_keys=[pre_form_id],
+    )
+    post_form = relationship(
+        "Form",
+        back_populates="post_test_stakeholders",
+        foreign_keys=[post_form_id],
     )
     interview_files = relationship(
         "ProjectInterviewFile",
@@ -229,6 +242,30 @@ class ProjectOutcome(Base):
 
     project = relationship("Project", back_populates="outcomes")
     form_pages = relationship("Page", back_populates="project_outcome")
+    valuation = relationship("ProjectOutcomeValuation", back_populates="outcome", uselist=False)
+
+
+class ProjectOutcomeValuation(Base):
+    __tablename__ = "project_outcome_valuations"
+    __table_args__ = (UniqueConstraint("outcome_id", name="uq_project_outcome_valuation_outcome"),)
+
+    valuation_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    outcome_id = Column(String(36), ForeignKey("project_outcomes.outcome_id", ondelete="CASCADE"), nullable=False, index=True)
+    quantity = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
+    financial_proxy_value = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
+    deadweight_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
+    attribution_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
+    displacement_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
+    duration_years = Column(Integer, nullable=False, default=1, server_default="1")
+    dropoff_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
+    is_included = Column(Boolean, nullable=False, default=True, server_default="true")
+    is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    project = relationship("Project", back_populates="outcome_valuations")
+    outcome = relationship("ProjectOutcome", back_populates="valuation")
 
 
 class ProjectInterviewFile(Base):
@@ -407,8 +444,6 @@ class AnswerChoice(Base):
 
     answer = relationship("Answer", back_populates="selected_options")
     option = relationship("QuestionOption", back_populates="answer_choices")
-
-from sqlalchemy import Numeric
 
 
 class FinancialProxy(Base):
