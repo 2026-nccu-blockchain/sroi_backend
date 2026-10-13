@@ -11,3 +11,4 @@ alembic
 python-multipart
 pillow
 pillow-heif
+pip-audit
