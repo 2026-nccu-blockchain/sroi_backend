@@ -268,6 +268,7 @@ class Page(Base):
         nullable=True,
         index=True,
     )
+    is_respondent_info = Column(Boolean, nullable=False, default=False)
     title = Column(String(255))
     content = Column(Text, nullable=False)
     position = Column(Integer, nullable=False, default=0)

@@ -176,6 +176,8 @@ def _validate_form_for_publish(form: Form) -> None:
     active_pages = [page for page in form.pages if not page.is_delete]
     if not active_pages:
         raise APIException(400, "20027", "At least one block is required before publishing")
+    if not any(page.is_respondent_info for page in active_pages):
+        raise APIException(400, "20032", "Respondent information block is required before publishing")
     for page in active_pages:
         if not page.title or not page.title.strip():
             raise APIException(400, "20028", "Every block needs a title before publishing")
@@ -183,10 +185,10 @@ def _validate_form_for_publish(form: Form) -> None:
             question for question in page.questions
             if not question.is_delete and not question.is_temp
         ]
-        if not any(question.question_type != QuestionType.DS for question in active_questions):
+        if not page.is_respondent_info and not any(question.question_type != QuestionType.DS for question in active_questions):
             raise APIException(400, "20029", f"Block has no answerable question: {page.page_id}")
         for question in active_questions:
-            question_text = question.content if question.question_type == QuestionType.DS else question.title
+            question_text = (question.title or question.content) if question.question_type == QuestionType.DS else question.title
             if not question_text or not question_text.strip():
                 raise APIException(400, "20030", f"Question is incomplete: {question.question_id}")
             if question.question_type == QuestionType.CQ:
@@ -212,10 +214,15 @@ def create_form(
     )
     if data.status == FormStatus.PUBLISHED:
         _ensure_public_token(form)
+    if sum(page.is_respondent_info for page in data.pages) > 1:
+        raise APIException(400, "20033", "A form can only have one respondent information block")
     for page_data in data.pages:
+        if page_data.is_respondent_info and page_data.project_outcome_id is not None:
+            raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
         _validate_project_outcome(db, page_data.project_outcome_id, user_id, data.project_id)
         page = Page(
             project_outcome_id=page_data.project_outcome_id,
+            is_respondent_info=page_data.is_respondent_info,
             title=page_data.title,
             content=page_data.content,
             position=page_data.position,
@@ -364,10 +371,21 @@ def create_page(
 ) -> Page:
     user_id = _user_id(payload)
     form = _owned_form(db, form_id, user_id)
+    if data.is_respondent_info:
+        existing = db.query(Page.page_id).filter(
+            Page.form_id == form_id,
+            Page.is_respondent_info.is_(True),
+            Page.is_delete.is_(False),
+        ).first()
+        if existing is not None:
+            raise APIException(400, "20033", "A form can only have one respondent information block")
+        if data.project_outcome_id is not None:
+            raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
     _validate_project_outcome(db, data.project_outcome_id, user_id, form.project_id)
     page = Page(
         form=form,
         project_outcome_id=data.project_outcome_id,
+        is_respondent_info=data.is_respondent_info,
         title=data.title,
         content=data.content,
         position=data.position,
@@ -397,6 +415,17 @@ def update_page(
     if page is None:
         raise APIException(404, "20002", "Page not found")
     changes = data.model_dump(exclude_unset=True)
+    if changes.get("is_respondent_info"):
+        duplicate = db.query(Page.page_id).filter(
+            Page.form_id == page.form_id,
+            Page.page_id != page.page_id,
+            Page.is_respondent_info.is_(True),
+            Page.is_delete.is_(False),
+        ).first()
+        if duplicate is not None:
+            raise APIException(400, "20033", "A form can only have one respondent information block")
+        if changes.get("project_outcome_id", page.project_outcome_id) is not None:
+            raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
     if "project_outcome_id" in changes:
         _validate_project_outcome(db, changes["project_outcome_id"], user_id, page.form.project_id)
     for field, value in changes.items():
@@ -481,8 +510,10 @@ def update_question(
     if question.question_type == QuestionType.SC:
         if question.scale_begin is None or question.scale_end is None:
             raise APIException(400, "20016", "Scale question requires scale_begin and scale_end")
-        if question.scale_begin >= question.scale_end:
-            raise APIException(400, "20017", "scale_begin must be smaller than scale_end")
+        if question.scale_begin != 1:
+            raise APIException(400, "20017", "Scale questions must start at 1")
+        if question.scale_end not in {3, 5, 7, 9}:
+            raise APIException(400, "20018", "Scale size must be 3, 5, 7, or 9")
     if question.question_type != QuestionType.CQ:
         for option in question.options:
             option.is_delete = True
