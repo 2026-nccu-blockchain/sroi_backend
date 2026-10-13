@@ -124,8 +124,12 @@ def _sync_outcomes_to_draft_forms(db: Session, project: Project) -> None:
                 page.title = outcome.name
             ordered_outcome_pages.append(page)
 
-        custom_pages = [page for page in pages if page not in ordered_outcome_pages]
-        for position, page in enumerate([*ordered_outcome_pages, *custom_pages]):
+        respondent_pages = [page for page in pages if page.is_respondent_info]
+        custom_pages = [
+            page for page in pages
+            if page not in respondent_pages and page not in ordered_outcome_pages
+        ]
+        for position, page in enumerate([*respondent_pages, *ordered_outcome_pages, *custom_pages]):
             page.position = position
 
 

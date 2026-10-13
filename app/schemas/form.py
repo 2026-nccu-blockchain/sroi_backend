@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from app.models.model import FormStatus, QuestionType, ResponseStatus
 
@@ -43,8 +43,10 @@ class QuestionCreate(BaseModel):
         if self.question_type == QuestionType.SC:
             if self.scale_begin is None or self.scale_end is None:
                 raise ValueError("量表題必須提供 scale_begin 與 scale_end")
-            if self.scale_begin >= self.scale_end:
-                raise ValueError("scale_begin 必須小於 scale_end")
+            if self.scale_begin != 1:
+                raise ValueError("量表題必須從 1 開始")
+            if self.scale_end not in {3, 5, 7, 9}:
+                raise ValueError("量表選項數只能是 3、5、7 或 9")
         if self.question_type == QuestionType.CQ and len(self.options) < 1:
             raise ValueError("選擇題至少需要一個選項")
         if self.question_type != QuestionType.CQ:
@@ -83,9 +85,19 @@ class QuestionRead(ORMModel):
     jump_rules: list[dict[str, str]] = Field(default_factory=list)
     options: list[QuestionOptionRead] = Field(default_factory=list)
 
+    @field_validator("jump_rules", mode="before")
+    @classmethod
+    def normalize_legacy_jump_rules(cls, value):
+        if value is None or value == {}:
+            return []
+        if isinstance(value, dict):
+            return [value]
+        return value
+
 
 class PageCreate(BaseModel):
     project_outcome_id: Optional[str] = None
+    is_respondent_info: bool = False
     title: Optional[str] = Field(default=None, max_length=255)
     content: str = ""
     position: int = Field(default=0, ge=0)
@@ -94,6 +106,7 @@ class PageCreate(BaseModel):
 
 class PageUpdate(BaseModel):
     project_outcome_id: Optional[str] = None
+    is_respondent_info: Optional[bool] = None
     title: Optional[str] = Field(default=None, max_length=255)
     content: Optional[str] = None
     position: Optional[int] = Field(default=None, ge=0)
@@ -102,6 +115,7 @@ class PageUpdate(BaseModel):
 class PageRead(ORMModel):
     page_id: str
     project_outcome_id: Optional[str]
+    is_respondent_info: bool
     title: Optional[str]
     content: str
     position: int
