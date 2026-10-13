@@ -136,11 +136,11 @@ class Form(Base):
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     # author = relationship("User", back_populates="forms")
-    pages = relationship("Page", back_populates="form", cascade="all, delete-orphan", order_by="Page.position")
+    pages = relationship("Page", back_populates="form", order_by="Page.position")
     questions = relationship("Question", back_populates="form", order_by="Question.position")
     answers = relationship("Answer", back_populates="form")
 
-    responses = relationship("FormResponse", back_populates="form", cascade="all, delete-orphan")
+    responses = relationship("FormResponse", back_populates="form")
     project = relationship("Project", back_populates="forms", foreign_keys=[project_id])
     linked_stakeholders = relationship(
         "ProjectStakeholder",
@@ -175,19 +175,16 @@ class Project(Base):
     stakeholders = relationship(
         "ProjectStakeholder",
         back_populates="project",
-        cascade="all, delete-orphan",
         order_by="ProjectStakeholder.position",
     )
     outcomes = relationship(
         "ProjectOutcome",
         back_populates="project",
-        cascade="all, delete-orphan",
         order_by="ProjectOutcome.position",
     )
     interview_files = relationship(
         "ProjectInterviewFile",
         back_populates="project",
-        cascade="all, delete-orphan",
         order_by="ProjectInterviewFile.create_time",
     )
 
@@ -202,6 +199,7 @@ class ProjectStakeholder(Base):
     notes = Column(Text, nullable=False, default="")
     linked_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)
     position = Column(Integer, nullable=False, default=0)
+    is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -214,8 +212,6 @@ class ProjectStakeholder(Base):
     interview_files = relationship(
         "ProjectInterviewFile",
         back_populates="stakeholder",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
         order_by="ProjectInterviewFile.create_time",
     )
 
@@ -227,6 +223,7 @@ class ProjectOutcome(Base):
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(255), nullable=False)
     position = Column(Integer, nullable=False, default=0)
+    is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -244,6 +241,7 @@ class ProjectInterviewFile(Base):
     stored_name = Column(String(255), nullable=False, unique=True)
     content_type = Column(String(100), nullable=False)
     size_bytes = Column(Integer, nullable=False)
+    is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
 
     project = relationship("Project", back_populates="interview_files")
@@ -288,7 +286,6 @@ class Page(Base):
     questions = relationship(
         "Question",
         back_populates="page",
-        cascade="all, delete-orphan",
         order_by="Question.position",
     )
 
@@ -319,7 +316,7 @@ class Question(Base):
     form = relationship("Form", back_populates="questions")
     page = relationship("Page", back_populates="questions")
     answers = relationship("Answer", back_populates="question")
-    options = relationship("QuestionOption",back_populates="question",cascade="all, delete-orphan",order_by="QuestionOption.position")
+    options = relationship("QuestionOption",back_populates="question",order_by="QuestionOption.position")
 
 
 class QuestionOption(Base):
@@ -364,7 +361,7 @@ class FormResponse(Base):
             "form_id",
             "respondent_email",
             unique=True,
-            postgresql_where=text("is_duplicate_legacy = false"),
+            postgresql_where=text("is_duplicate_legacy = false AND is_delete = false"),
         ),
     )
 
@@ -375,8 +372,9 @@ class FormResponse(Base):
     started_at = Column(DateTime(timezone=True),server_default=func.now(),nullable=False)
     submitted_at = Column(DateTime(timezone=True))
     is_duplicate_legacy = Column(Boolean, nullable=False, default=False, server_default="false")
+    is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     form = relationship("Form",back_populates="responses")
-    answers = relationship("Answer",back_populates="response",cascade="all, delete-orphan")
+    answers = relationship("Answer",back_populates="response")
 
 class Answer(Base):
     __tablename__ = "answers"
@@ -398,7 +396,7 @@ class Answer(Base):
     form = relationship("Form", back_populates="answers")
     question = relationship("Question", back_populates="answers")
     response = relationship("FormResponse", back_populates="answers")
-    selected_options = relationship("AnswerChoice", back_populates="answer", cascade="all, delete-orphan")
+    selected_options = relationship("AnswerChoice", back_populates="answer")
 
 
 class AnswerChoice(Base):

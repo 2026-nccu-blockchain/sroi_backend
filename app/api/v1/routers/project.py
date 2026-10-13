@@ -37,6 +37,9 @@ def _project_query(db: Session):
         selectinload(Project.linked_form),
         selectinload(Project.forms),
         with_loader_criteria(Form, Form.is_delete.is_(False)),
+        with_loader_criteria(ProjectStakeholder, ProjectStakeholder.is_delete.is_(False)),
+        with_loader_criteria(ProjectOutcome, ProjectOutcome.is_delete.is_(False)),
+        with_loader_criteria(ProjectInterviewFile, ProjectInterviewFile.is_delete.is_(False)),
     )
 
 
@@ -64,28 +67,41 @@ def _validate_linked_form(db: Session, form_id: str | None, owner_id: str) -> No
 
 
 def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> None:
-    project.stakeholders.clear()
+    existing = {
+        stakeholder.stakeholder_id: stakeholder
+        for stakeholder in project.stakeholders
+        if not stakeholder.is_delete
+    }
     for position, item in enumerate(items):
-        project.stakeholders.append(ProjectStakeholder(
-            name=item.name,
-            role=item.role,
-            email=str(item.email) if item.email else None,
-            notes=item.notes,
-            position=position,
-        ))
+        stakeholder = existing.pop(item.stakeholder_id, None) if item.stakeholder_id else None
+        if stakeholder is None:
+            stakeholder = ProjectStakeholder()
+            project.stakeholders.append(stakeholder)
+        stakeholder.name = item.name
+        stakeholder.role = item.role
+        stakeholder.notes = item.notes
+        stakeholder.position = position
+    for stakeholder in existing.values():
+        stakeholder.is_delete = True
+        for record in stakeholder.interview_files:
+            record.is_delete = True
 
 
 def _replace_outcomes(project: Project, items: list[OutcomeInput]) -> None:
-    existing = {outcome.outcome_id: outcome for outcome in project.outcomes}
-    ordered: list[ProjectOutcome] = []
+    existing = {
+        outcome.outcome_id: outcome
+        for outcome in project.outcomes
+        if not outcome.is_delete
+    }
     for position, item in enumerate(items):
         outcome = existing.pop(item.outcome_id, None) if item.outcome_id else None
         if outcome is None:
             outcome = ProjectOutcome()
+            project.outcomes.append(outcome)
         outcome.name = item.name.strip()
         outcome.position = position
-        ordered.append(outcome)
-    project.outcomes = ordered
+    for outcome in existing.values():
+        outcome.is_delete = True
 
 
 def _sync_outcomes_to_draft_forms(db: Session, project: Project) -> None:
@@ -108,8 +124,12 @@ def _sync_outcomes_to_draft_forms(db: Session, project: Project) -> None:
             if page.project_outcome_id is not None
         }
 
+        active_outcomes = sorted(
+            (outcome for outcome in project.outcomes if not outcome.is_delete),
+            key=lambda outcome: outcome.position,
+        )
         ordered_outcome_pages: list[Page] = []
-        for outcome in project.outcomes:
+        for outcome in active_outcomes:
             page = pages_by_outcome.get(outcome.outcome_id)
             if page is None:
                 page = Page(
@@ -285,6 +305,7 @@ def download_interview_file(
     record = db.query(ProjectInterviewFile).filter(
         ProjectInterviewFile.file_id == file_id,
         ProjectInterviewFile.project_id == project_id,
+        ProjectInterviewFile.is_delete.is_(False),
     ).first()
     if record is None:
         raise APIException(404, "30006", "訪綱檔案不存在")
@@ -305,11 +326,9 @@ def delete_interview_file(
     record = db.query(ProjectInterviewFile).filter(
         ProjectInterviewFile.file_id == file_id,
         ProjectInterviewFile.project_id == project_id,
+        ProjectInterviewFile.is_delete.is_(False),
     ).first()
     if record is None:
         raise APIException(404, "30006", "訪綱檔案不存在")
-    path = (INTERVIEW_UPLOAD_DIR / record.stored_name).resolve()
-    db.delete(record)
+    record.is_delete = True
     db.commit()
-    if path.parent == INTERVIEW_UPLOAD_DIR.resolve() and path.is_file():
-        path.unlink()
