@@ -2,13 +2,14 @@ from datetime import datetime, timedelta, timezone
 import secrets
 
 from fastapi import APIRouter, Depends, status, Request
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
 from app.core.deps import return_payload
 from app.core.exceptions import APIException
+from app.core.permissions import accessible_project_filter, require_form_role, require_project_role
 from app.db.session import get_db
 from app.models.model import (
     Answer,
@@ -16,6 +17,7 @@ from app.models.model import (
     Form,
     FormResponse,
     FormStatus,
+    GroupRole,
     Page,
     Project,
     ProjectOutcome,
@@ -53,25 +55,21 @@ def _user_id(payload: dict) -> str:
     return str(user_id)
 
 
-def _owned_form(db: Session, form_id: str, user_id: str) -> Form:
+def _get_form(db: Session, form_id: str, user_id: str, min_role: GroupRole = GroupRole.EDITOR) -> Form:
     form = db.query(Form).filter(
         Form.form_id == form_id,
-        Form.author_id == user_id,
         Form.is_delete.is_(False),
     ).first()
-    if form is None:
-        raise APIException(404, "20001", "Form not found")
+    require_form_role(db, form, user_id, min_role)
     return form
 
 
-def _owned_project(db: Session, project_id: str, user_id: str) -> Project:
+def _get_project(db: Session, project_id: str, user_id: str, min_role: GroupRole) -> Project:
     project = db.query(Project).filter(
         Project.project_id == project_id,
-        Project.owner_id == user_id,
         Project.is_delete.is_(False),
     ).first()
-    if project is None:
-        raise APIException(404, "30001", "Project not found")
+    require_project_role(db, project, user_id, min_role)
     return project
 
 
@@ -83,16 +81,16 @@ def _validate_project_outcome(
 ) -> None:
     if outcome_id is None:
         return
-    query = db.query(ProjectOutcome.outcome_id).join(Project).filter(
+    query = db.query(Project).join(ProjectOutcome).filter(
         ProjectOutcome.outcome_id == outcome_id,
-        Project.owner_id == user_id,
         Project.is_delete.is_(False),
     )
     if project_id is not None:
         query = query.filter(ProjectOutcome.project_id == project_id)
-    exists = query.first()
-    if exists is None:
+    project = query.first()
+    if project is None:
         raise APIException(400, "30003", "Project outcome does not belong to this user")
+    require_project_role(db, project, user_id, GroupRole.EDITOR)
 
 
 def _form_query(db: Session):
@@ -204,7 +202,7 @@ def create_form(
     payload: dict = Depends(return_payload),
 ) -> Form:
     user_id = _user_id(payload)
-    _owned_project(db, data.project_id, user_id)
+    _get_project(db, data.project_id, user_id, GroupRole.EDITOR)
     form = Form(
         author_id=user_id,
         project_id=data.project_id,
@@ -249,8 +247,16 @@ def list_forms(
     payload: dict = Depends(return_payload),
 ) -> list[Form]:
     _cleanup_expired_temporary_questions(db)
+    user_id = _user_id(payload)
+    accessible_project_ids = db.query(Project.project_id).filter(
+        accessible_project_filter(db, user_id),
+        Project.is_delete.is_(False),
+    )
     return _form_query(db).filter(
-        Form.author_id == _user_id(payload),
+        or_(
+            and_(Form.project_id.is_(None), Form.author_id == user_id),
+            Form.project_id.in_(accessible_project_ids),
+        ),
         Form.is_delete.is_(False),
     ).order_by(Form.create_time.desc()).all()
 
@@ -262,7 +268,7 @@ def get_form(
     payload: dict = Depends(return_payload),
 ) -> Form:
     _cleanup_expired_temporary_questions(db)
-    _owned_form(db, form_id, _user_id(payload))
+    _get_form(db, form_id, _user_id(payload), GroupRole.VIEWER)
     return _form_query(db).filter(Form.form_id == form_id).one()
 
 
@@ -285,7 +291,7 @@ def update_form(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Form:
-    form = _owned_form(db, form_id, _user_id(payload))
+    form = _get_form(db, form_id, _user_id(payload))
     for field, value in data.model_dump(exclude_unset=True).items():
         setattr(form, field, value)
     if form.status == FormStatus.PUBLISHED:
@@ -304,7 +310,7 @@ def save_form_structure(
     payload: dict = Depends(return_payload),
 ) -> Form:
     """Finalize temporary questions and build the default linked-list order."""
-    form = _owned_form(db, form_id, _user_id(payload))
+    form = _get_form(db, form_id, _user_id(payload))
     active_pages = db.query(Page).filter(
         Page.form_id == form_id,
         Page.is_delete.is_(False),
@@ -357,7 +363,7 @@ def delete_form(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> None:
-    form = _owned_form(db, form_id, _user_id(payload))
+    form = _get_form(db, form_id, _user_id(payload))
     form.is_delete = True
     db.commit()
 
@@ -370,7 +376,7 @@ def create_page(
     payload: dict = Depends(return_payload),
 ) -> Page:
     user_id = _user_id(payload)
-    form = _owned_form(db, form_id, user_id)
+    form = _get_form(db, form_id, user_id)
     if data.is_respondent_info:
         existing = db.query(Page.page_id).filter(
             Page.form_id == form_id,
@@ -409,11 +415,11 @@ def update_page(
     page = db.query(Page).join(Form).filter(
         Page.page_id == page_id,
         Page.is_delete.is_(False),
-        Form.author_id == user_id,
         Form.is_delete.is_(False),
     ).first()
     if page is None:
         raise APIException(404, "20002", "Page not found")
+    require_form_role(db, page.form, user_id, GroupRole.EDITOR)
     changes = data.model_dump(exclude_unset=True)
     if changes.get("is_respondent_info"):
         duplicate = db.query(Page.page_id).filter(
@@ -444,11 +450,11 @@ def delete_page(
     page = db.query(Page).options(selectinload(Page.questions)).join(Form).filter(
         Page.page_id == page_id,
         Page.is_delete.is_(False),
-        Form.author_id == _user_id(payload),
         Form.is_delete.is_(False),
     ).first()
     if page is None:
         raise APIException(404, "20002", "Page not found")
+    require_form_role(db, page.form, _user_id(payload), GroupRole.EDITOR)
     active_page_count = db.query(Page).filter(
         Page.form_id == page.form_id,
         Page.is_delete.is_(False),
@@ -470,7 +476,7 @@ def create_question(
     payload: dict = Depends(return_payload),
 ) -> Question:
     _cleanup_expired_temporary_questions(db)
-    form = _owned_form(db, form_id, _user_id(payload))
+    form = _get_form(db, form_id, _user_id(payload))
     page = db.query(Page).filter(
         Page.page_id == page_id,
         Page.form_id == form_id,
@@ -495,11 +501,11 @@ def update_question(
     question = db.query(Question).options(selectinload(Question.options)).join(Form).filter(
         Question.question_id == question_id,
         Question.is_delete.is_(False),
-        Form.author_id == _user_id(payload),
         Form.is_delete.is_(False),
     ).first()
     if question is None:
         raise APIException(404, "20003", "Question not found")
+    require_form_role(db, question.form, _user_id(payload), GroupRole.EDITOR)
 
     changes = data.model_dump(exclude_unset=True)
     option_data = changes.pop("options", None)
@@ -555,11 +561,12 @@ def delete_question(
 ) -> None:
     question = db.query(Question).join(Form).filter(
         Question.question_id == question_id,
-        Form.author_id == _user_id(payload),
         Question.is_delete.is_(False),
+        Form.is_delete.is_(False),
     ).first()
     if question is None:
         raise APIException(404, "20003", "Question not found")
+    require_form_role(db, question.form, _user_id(payload), GroupRole.EDITOR)
     question.is_delete = True
     db.commit()
 
@@ -714,7 +721,7 @@ def list_responses(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> list[FormResponseRead]:
-    _owned_form(db, form_id, _user_id(payload))
+    _get_form(db, form_id, _user_id(payload), GroupRole.VIEWER)
     responses = db.query(FormResponse).options(
         selectinload(FormResponse.answers).selectinload(Answer.selected_options)
     ).filter(FormResponse.form_id == form_id).order_by(FormResponse.submitted_at.desc()).all()

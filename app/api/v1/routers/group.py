@@ -2,7 +2,7 @@ from fastapi import APIRouter, Request, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from app.db.session import get_db
-from app.models.model import Role, Account, VerifiedInProgress, Group, GroupAccount
+from app.models.model import Role, GroupRole, Account, VerifiedInProgress, Group, GroupAccount
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
@@ -35,18 +35,21 @@ def invite_group(request: Request, GroupId: str, data: InviteRequest, db: Sessio
     user = db.query(Account).filter(Account.user_id == user_id, Account.role != Role.UNVERIFIED, 
                                     Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
     group_leader = db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == user_id, 
-                                                 GroupAccount.group_role == Role.LEADER, GroupAccount.is_delete == False).first()
+                                                 GroupAccount.group_role == GroupRole.LEADER, GroupAccount.is_delete == False).first()
     if user is None or group_leader is None:
         raise APIException(400, "10008", "permission denied")
     if db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == invited_user.user_id,
                                       GroupAccount.is_delete == False).first() is not None:
         raise APIException(400, "10014", "group member already exists")
-    group.member_list = (group.member_list or []) + [f"{invited_user.user_id}"]
+    if data.group_role == GroupRole.LEADER:
+        group.leader_list = (group.leader_list or []) + [f"{invited_user.user_id}"]
+    else:
+        group.member_list = (group.member_list or []) + [f"{invited_user.user_id}"]
     invited_user.group_list = (invited_user.group_list or []) + [f"{group.group_id}"]
     new_GA = GroupAccount(
         group_id=group.group_id,
         user_id=invited_user.user_id,
-        group_role=Role.MEMBER
+        group_role=data.group_role
     )
     db.add(new_GA)
     db.commit()
@@ -75,7 +78,7 @@ def change_permission(request: Request, GroupId: str, data: ChangeRoleRequest, d
     if change_user is None:
         raise APIException(404, "10001", "user not found")
     group_leader = db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == user_id, 
-                                                 GroupAccount.group_role == Role.LEADER, GroupAccount.is_delete == False).first()
+                                                 GroupAccount.group_role == GroupRole.LEADER, GroupAccount.is_delete == False).first()
     if group_leader is None:
         raise APIException(400, "10008", "permission denied")
     if group_leader.user_id == change_user.user_id:
@@ -83,23 +86,25 @@ def change_permission(request: Request, GroupId: str, data: ChangeRoleRequest, d
     change = db.query(GroupAccount).filter(GroupAccount.user_id == data.user_id, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
     if change is None:
         raise APIException(404, "10001", "user not found")
-    if change.group_role == (Role.LEADER if data.is_leader else Role.MEMBER):
+    new_role = data.target_role()
+    if new_role is None:
+        raise APIException(400, "10022", "group_role is required")
+    if change.group_role == new_role:
         raise APIException(400, "10017", "role unchanged")
-    if data.is_leader:
-        change.group_role = Role.LEADER
+    # leader_list 放組長，member_list 放編輯者與檢視者
+    if new_role == GroupRole.LEADER:
         group.member_list = [
-            member for member in group.member_list
+            member for member in (group.member_list or [])
             if member != data.user_id
         ]
         group.leader_list = (group.leader_list or []) + [f"{data.user_id}"]
-
-    else:
-        change.group_role = Role.MEMBER
+    elif change.group_role == GroupRole.LEADER:
         group.leader_list = [
-            leader for leader in group.leader_list
+            leader for leader in (group.leader_list or [])
             if leader != data.user_id
         ]
         group.member_list = (group.member_list or []) + [f"{data.user_id}"]
+    change.group_role = new_role
     db.commit()
 
     return APIResponse(
@@ -125,13 +130,13 @@ def delete_member(request: Request, GroupId: str, UserId: str, db: Session = Dep
     if delete_member is None:
         raise APIException(404, "10001", "user not found")
     group_leader = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == GroupId, 
-                                                 GroupAccount.group_role == Role.LEADER, GroupAccount.is_delete == False).first()
+                                                 GroupAccount.group_role == GroupRole.LEADER, GroupAccount.is_delete == False).first()
     if group_leader is None and user.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
-    if delete_member.group_role == Role.LEADER and len(group.leader_list or []) <= 1:
+    if delete_member.group_role == GroupRole.LEADER and len(group.leader_list or []) <= 1:
         raise APIException(400, "10016", "at least one leader")
     delete_member.is_delete = True
-    if delete_member.group_role == Role.LEADER:
+    if delete_member.group_role == GroupRole.LEADER:
         group.leader_list = [
             leader for leader in group.leader_list
             if leader != UserId
@@ -176,6 +181,10 @@ def get_group_info(request: Request, GroupId: str, db: Session = Depends(get_db)
         raise APIException(404, "10013", "group not found")
     group_leaders = db.query(Account).filter(Account.user_id.in_(group.leader_list or []), Account.is_delete == False).all()
     group_members = db.query(Account).filter(Account.user_id.in_(group.member_list or []), Account.is_delete == False).all()
+    member_roles = {
+        ga.user_id: ga.group_role.value
+        for ga in db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).all()
+    }
 
     return APIResponse(
         status_code="00000",
@@ -200,7 +209,8 @@ def get_group_info(request: Request, GroupId: str, db: Session = Depends(get_db)
             {
                 "user_id": gm.user_id,
                 "campus_id": gm.campus_id,
-                "name": gm.name
+                "name": gm.name,
+                "group_role": member_roles.get(gm.user_id)
             }
             for gm in group_members
         ],
@@ -227,7 +237,7 @@ def get_group_role(request: Request, GroupId: str, db: Session = Depends(get_db)
         status_code="00000",
         message="success",
         response_datetime=datetime.now(),
-        group_role=member.group_role.value
+        group_role=member.group_role.value if member else None
     )
 
 
@@ -244,7 +254,7 @@ def group_search_user(request: Request, GroupId: str, Search: str, db: Session =
     if group is None:
         raise APIException(404, "10013", "group not found")
     group_leader = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == GroupId, 
-                                                 GroupAccount.group_role == Role.LEADER, GroupAccount.is_delete == False).first()
+                                                 GroupAccount.group_role == GroupRole.LEADER, GroupAccount.is_delete == False).first()
     if group_leader is None and user.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     users = db.query(Account).filter(or_(Account.campus_id.ilike(f"%{Search}%"), Account.name.ilike(f"%{Search}%")), 

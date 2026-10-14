@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models.model import Role, Account, VerifiedInProgress, Group, GroupAccount
+from app.models.model import Role, GroupRole, Account, VerifiedInProgress, Group, GroupAccount
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
@@ -170,7 +170,7 @@ def confirm_group(request: Request, GroupId: str, db: Session = Depends(get_db))
     new_GA = GroupAccount(
         group_id=group.group_id,
         user_id=group.leader_list[0],
-        group_role=Role.LEADER
+        group_role=GroupRole.LEADER
     )
     db.add(new_GA)
     db.commit()
@@ -430,6 +430,10 @@ def show_one_group(request: Request, GroupId: str, db: Session = Depends(get_db)
         raise APIException(404, "10013", "group not found")
     group_leaders = db.query(Account).filter(Account.user_id.in_(group.leader_list or []), Account.is_delete == False).all()
     group_members = db.query(Account).filter(Account.user_id.in_(group.member_list or []), Account.is_delete == False).all()
+    member_roles = {
+        ga.user_id: ga.group_role.value
+        for ga in db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).all()
+    }
 
     return APIResponse(
         status_code="00000",
@@ -454,7 +458,8 @@ def show_one_group(request: Request, GroupId: str, db: Session = Depends(get_db)
             {
                 "user_id": gm.user_id,
                 "campus_id": gm.campus_id,
-                "name": gm.name
+                "name": gm.name,
+                "group_role": member_roles.get(gm.user_id)
             }
             for gm in group_members
         ],

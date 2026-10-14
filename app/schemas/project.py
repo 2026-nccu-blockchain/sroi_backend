@@ -4,7 +4,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
-from app.models.model import FormStatus
+from app.models.model import FormStatus, GroupRole
 
 
 class ORMModel(BaseModel):
@@ -53,6 +53,7 @@ class LinkedFormRead(ORMModel):
 
 
 class ProjectCreate(BaseModel):
+    group_id: Optional[str] = None  # 不帶就是個人專案
     name: str = Field(min_length=1, max_length=255)
     organization: str = Field(default="", max_length=255)
     description: str = ""
@@ -78,7 +79,10 @@ class ProjectUpdate(BaseModel):
 
 class ProjectRead(ORMModel):
     project_id: str
-    owner_id: str
+    owner_id: Optional[str]
+    group_id: Optional[str]
+    created_by: str
+    my_role: Optional[GroupRole] = None
     name: str
     organization: str
     description: str
