@@ -62,7 +62,7 @@ def _validate_stakeholder_forms(
     owner_id: str,
     project_id: str | None = None,
 ) -> None:
-    """前測、後測表單必須是自己的、未刪除，且沒有綁到其他專案。"""
+    """前測、後測表單只能選這個專案底下、未刪除的表單；新建專案時還沒有表單可選。"""
     form_ids = {
         form_id
         for item in items
@@ -71,16 +71,17 @@ def _validate_stakeholder_forms(
     }
     if not form_ids:
         return
-    query = db.query(Form.form_id).filter(
-        Form.form_id.in_(form_ids),
-        Form.author_id == owner_id,
-        Form.is_delete.is_(False),
-    )
     if project_id is None:
-        query = query.filter(Form.project_id.is_(None))
-    else:
-        query = query.filter((Form.project_id.is_(None)) | (Form.project_id == project_id))
-    valid_ids = {form_id for (form_id,) in query.all()}
+        raise APIException(400, "30002", "Linked form does not belong to this project")
+    valid_ids = {
+        form_id
+        for (form_id,) in db.query(Form.form_id).filter(
+            Form.form_id.in_(form_ids),
+            Form.project_id == project_id,
+            Form.author_id == owner_id,
+            Form.is_delete.is_(False),
+        ).all()
+    }
     if valid_ids != form_ids:
         raise APIException(400, "30002", "Linked form does not belong to this project")
 
