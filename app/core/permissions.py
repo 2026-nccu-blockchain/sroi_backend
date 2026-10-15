@@ -2,7 +2,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import APIException
-from app.models.model import Form, Group, GroupAccount, GroupRole, Project, Role
+from app.models.model import Account, Form, Group, GroupAccount, GroupRole, Project, Role
 
 
 ROLE_LEVEL = {GroupRole.VIEWER: 1, GroupRole.EDITOR: 2, GroupRole.LEADER: 3}
@@ -25,6 +25,34 @@ def _active_membership_query(db: Session, user_id: str):
 def get_group_role(db: Session, group_id: str, user_id: str) -> GroupRole | None:
     membership = _active_membership_query(db, user_id).filter(GroupAccount.group_id == group_id).first()
     return membership.group_role if membership else None
+
+
+def get_group_members(db: Session, group_id: str) -> tuple[list[dict], list[dict]]:
+    """群組成員名單，回傳 (組長, 其他成員)；不看群組審核狀態"""
+    rows = db.query(Account, GroupAccount.group_role).join(
+        GroupAccount, GroupAccount.user_id == Account.user_id
+    ).filter(
+        GroupAccount.group_id == group_id,
+        GroupAccount.is_delete.is_(False),
+        Account.is_delete.is_(False),
+    ).order_by(GroupAccount.create_time).all()
+    leaders = [
+        {"user_id": a.user_id, "campus_id": a.campus_id, "name": a.name}
+        for a, role in rows if role == GroupRole.LEADER
+    ]
+    members = [
+        {"user_id": a.user_id, "campus_id": a.campus_id, "name": a.name, "group_role": role.value}
+        for a, role in rows if role != GroupRole.LEADER
+    ]
+    return leaders, members
+
+
+def count_group_leaders(db: Session, group_id: str) -> int:
+    return db.query(GroupAccount).filter(
+        GroupAccount.group_id == group_id,
+        GroupAccount.group_role == GroupRole.LEADER,
+        GroupAccount.is_delete.is_(False),
+    ).count()
 
 
 def get_user_group_roles(db: Session, user_id: str) -> dict[str, GroupRole]:

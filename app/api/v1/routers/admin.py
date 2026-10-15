@@ -9,6 +9,7 @@ from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
 from app.api.v1.routers.upload import MEDIA_TYPES
+from app.core.permissions import count_group_leaders, get_group_members
 from app.schemas.admin import (
     UnconfirmGroupRequest
 )
@@ -166,13 +167,10 @@ def confirm_group(request: Request, GroupId: str, db: Session = Depends(get_db))
     group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.IN_PROGRESS, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
+    # 申請人在 add_group 時就已經是組長，這裡只要改狀態
+    if count_group_leaders(db, group.group_id) == 0:
+        raise APIException(400, "10023", "group has no applicant")
     group.status = Role.VERIFIED
-    new_GA = GroupAccount(
-        group_id=group.group_id,
-        user_id=group.leader_list[0],
-        group_role=GroupRole.LEADER
-    )
-    db.add(new_GA)
     db.commit()
 
     return APIResponse(
@@ -428,12 +426,7 @@ def show_one_group(request: Request, GroupId: str, db: Session = Depends(get_db)
     group = db.query(Group).filter(Group.group_id == GroupId, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
-    group_leaders = db.query(Account).filter(Account.user_id.in_(group.leader_list or []), Account.is_delete == False).all()
-    group_members = db.query(Account).filter(Account.user_id.in_(group.member_list or []), Account.is_delete == False).all()
-    member_roles = {
-        ga.user_id: ga.group_role.value
-        for ga in db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).all()
-    }
+    group_leaders, group_members = get_group_members(db, GroupId)
 
     return APIResponse(
         status_code="00000",
@@ -446,23 +439,8 @@ def show_one_group(request: Request, GroupId: str, db: Session = Depends(get_db)
         end=group.end,
         status=group.status.value,
         reason=group.reason,
-        group_leaders=[
-            {
-                "user_id": gl.user_id,
-                "campus_id": gl.campus_id,
-                "name": gl.name
-            }
-            for gl in group_leaders
-        ],
-        group_members=[
-            {
-                "user_id": gm.user_id,
-                "campus_id": gm.campus_id,
-                "name": gm.name,
-                "group_role": member_roles.get(gm.user_id)
-            }
-            for gm in group_members
-        ],
+        group_leaders=group_leaders,
+        group_members=group_members,
     )
 
 

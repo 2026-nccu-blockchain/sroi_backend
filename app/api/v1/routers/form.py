@@ -84,7 +84,6 @@ def _validate_project_outcome(
     query = db.query(Project).join(ProjectOutcome).filter(
         ProjectOutcome.outcome_id == outcome_id,
         ProjectOutcome.is_delete.is_(False),
-        Project.owner_id == user_id,
         Project.is_delete.is_(False),
     )
     if project_id is not None:

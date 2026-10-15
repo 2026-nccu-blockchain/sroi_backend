@@ -51,7 +51,6 @@ class Account(Base):
     name = Column(String(20), nullable=False)
     role = Column(SQLEnum(Role), nullable=False)
     id_card_link = Column(String(255))
-    group_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
@@ -105,8 +104,6 @@ class Group(Base):
     begin = Column(DateTime(timezone=True), nullable=False)
     end = Column(DateTime(timezone=True), nullable=False)
     status = Column(SQLEnum(Role), nullable=False)
-    leader_list = Column(ARRAY(String(255)))
-    member_list = Column(ARRAY(String(255)))
     reason = Column(Text, nullable=True)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -117,10 +114,20 @@ class Group(Base):
 
 class GroupAccount(Base):
     __tablename__ = "group_account"
+    __table_args__ = (
+        # 同一個人在同一個群組只能有一筆有效成員資料（軟刪除的不算）
+        Index(
+            "uq_group_account_active",
+            "group_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_delete = false"),
+        ),
+    )
 
     uuid  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    group_id = Column(String(36), nullable=False)
-    user_id = Column(String(36), nullable=False)
+    group_id = Column(String(36), ForeignKey("groups.group_id"), nullable=False, index=True)
+    user_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False, index=True)
     group_role = Column(SQLEnum(GroupRole), nullable=False, default=GroupRole.VIEWER)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -172,14 +179,9 @@ class Project(Base):
     )
 
     project_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-<<<<<<< HEAD
     owner_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=True, index=True)  # 個人專案擁有者
     group_id = Column(String(36), ForeignKey("groups.group_id"), nullable=True, index=True)  # 群組專案擁有者
     created_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=False)
-    linked_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)
-=======
-    owner_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False, index=True)
->>>>>>> main
     name = Column(String(255), nullable=False)
     organization = Column(String(255), nullable=False, default="")
     description = Column(Text, nullable=False, default="")
@@ -192,18 +194,9 @@ class Project(Base):
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
-<<<<<<< HEAD
     owner = relationship("Account", back_populates="projects", foreign_keys=[owner_id])
     group = relationship("Group", back_populates="projects")
     creator = relationship("Account", foreign_keys=[created_by])
-    linked_form = relationship(
-        "Form",
-        back_populates="linked_projects",
-        foreign_keys=[linked_form_id],
-    )
-=======
-    owner = relationship("Account", back_populates="projects")
->>>>>>> main
     forms = relationship(
         "Form",
         back_populates="project",

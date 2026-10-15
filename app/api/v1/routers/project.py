@@ -5,11 +5,7 @@ from typing import Literal, Optional
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
-<<<<<<< HEAD
-from fastapi import APIRouter, Depends, File, Query, UploadFile, status
-=======
-from fastapi import APIRouter, Depends, File, Form as FormField, UploadFile, status
->>>>>>> main
+from fastapi import APIRouter, Depends, File, Form as FormField, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload, with_loader_criteria
 from starlette.concurrency import run_in_threadpool
@@ -21,7 +17,6 @@ from app.core.permissions import (
     get_group_role,
     get_user_group_roles,
     has_role,
-    require_form_role,
     require_project_role,
 )
 from app.db.session import get_db
@@ -34,6 +29,7 @@ INTERVIEW_UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "interv
 INTERVIEW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_INTERVIEW_FILE_SIZE = 10 * 1024 * 1024
 READ_CHUNK_SIZE = 1024 * 1024
+NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "actual_input_cost", "begin", "end", "status"}
 
 
 def _user_id(payload: dict) -> str:
@@ -68,25 +64,13 @@ def _get_project(db: Session, project_id: str, user_id: str, min_role: GroupRole
     return project
 
 
-<<<<<<< HEAD
-def _validate_linked_form(db: Session, form_id: str | None, user_id: str) -> None:
-    if form_id is None:
-        return
-    form = db.query(Form).filter(
-        Form.form_id == form_id,
-        Form.is_delete.is_(False),
-    ).first()
-    if form is None:
-        raise APIException(400, "30002", "Linked form does not belong to this user")
-    require_form_role(db, form, user_id, GroupRole.EDITOR)
-=======
 def _validate_stakeholder_forms(
     db: Session,
     items: list[StakeholderInput],
-    owner_id: str,
     project_id: str | None = None,
 ) -> None:
-    """前測、後測表單只能選這個專案底下、未刪除的表單；新建專案時還沒有表單可選。"""
+    """前測、後測表單只能選這個專案底下、未刪除的表單；新建專案時還沒有表單可選。
+    群組專案的表單可能是其他成員建立的，所以不限作者，權限由專案角色控管。"""
     form_ids = {
         form_id
         for item in items
@@ -102,7 +86,6 @@ def _validate_stakeholder_forms(
         for (form_id,) in db.query(Form.form_id).filter(
             Form.form_id.in_(form_ids),
             Form.project_id == project_id,
-            Form.author_id == owner_id,
             Form.is_delete.is_(False),
         ).all()
     }
@@ -121,9 +104,8 @@ def _owned_stakeholder(db: Session, project_id: str, stakeholder_id: str) -> Pro
         ProjectStakeholder.is_delete.is_(False),
     ).first()
     if stakeholder is None:
-        raise APIException(404, "30007", "利害關係人不存在")
+        raise APIException(404, "30009", "利害關係人不存在")
     return stakeholder
->>>>>>> main
 
 
 def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> None:
@@ -272,16 +254,11 @@ def create_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Project:
-<<<<<<< HEAD
     user_id = _user_id(payload)
     if data.group_id is not None:
         if not has_role(get_group_role(db, data.group_id, user_id), GroupRole.EDITOR):
             raise APIException(403, "30007", "Insufficient project permission")
-    _validate_linked_form(db, data.linked_form_id, user_id)
-=======
-    owner_id = _user_id(payload)
-    _validate_stakeholder_forms(db, data.stakeholders, owner_id)
->>>>>>> main
+    _validate_stakeholder_forms(db, data.stakeholders)
     project = Project(
         owner_id=user_id if data.group_id is None else None,
         group_id=data.group_id,
@@ -323,18 +300,17 @@ def update_project(
     changes = data.model_dump(exclude_unset=True)
     stakeholders = changes.pop("stakeholders", None)
     outcomes = changes.pop("outcomes", None)
-<<<<<<< HEAD
-    if "linked_form_id" in changes:
-        _validate_linked_form(db, changes["linked_form_id"], user_id)
-=======
->>>>>>> main
+    # exclude_unset 不會排除明確送 null 的欄位，NOT NULL 欄位要先擋掉
+    for field in NON_NULLABLE_PROJECT_FIELDS & changes.keys():
+        if changes[field] is None:
+            raise APIException(400, "30008", f"{field} cannot be null")
     for field, value in changes.items():
         setattr(project, field, value)
     if _as_aware(project.end) < _as_aware(project.begin):
         raise APIException(400, "30008", "結束時間不可早於開始時間")
     if stakeholders is not None:
         stakeholder_items = [StakeholderInput(**item) for item in stakeholders]
-        _validate_stakeholder_forms(db, stakeholder_items, owner_id, project_id)
+        _validate_stakeholder_forms(db, stakeholder_items, project_id)
         _replace_stakeholders(project, stakeholder_items)
     if outcomes is not None:
         _replace_outcomes(
@@ -367,12 +343,8 @@ async def upload_interview_file(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> ProjectInterviewFile:
-<<<<<<< HEAD
     project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
-=======
-    project = _owned_project(db, project_id, _user_id(payload))
     stakeholder = _owned_stakeholder(db, project_id, stakeholder_id)
->>>>>>> main
     data = await _read_interview_file(file)
     detected = _detect_interview_type(data)
     if detected is None:
