@@ -115,3 +115,56 @@ class ProjectRead(ORMModel):
     interview_files: list[InterviewFileRead] = Field(default_factory=list)
     create_time: Optional[datetime]
     update_time: Optional[datetime]
+
+
+class OutcomeValuationInput(BaseModel):
+    outcome_id: str
+    quantity: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
+    financial_proxy_value: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
+    deadweight_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
+    attribution_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
+    displacement_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
+    duration_years: int = Field(default=1, ge=1, le=20)
+    dropoff_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
+    is_included: bool = True
+
+
+class ProjectSROIUpdate(BaseModel):
+    actual_input_cost: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
+    outcomes: list[OutcomeValuationInput] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def check_unique_outcomes(self) -> "ProjectSROIUpdate":
+        outcome_ids = [item.outcome_id for item in self.outcomes]
+        if len(outcome_ids) != len(set(outcome_ids)):
+            raise ValueError("成果不可重複")
+        return self
+
+
+class OutcomeValuationRead(BaseModel):
+    outcome_id: str
+    outcome_name: str
+    position: int
+    quantity: Decimal
+    financial_proxy_value: Decimal
+    deadweight_rate: Decimal
+    attribution_rate: Decimal
+    displacement_rate: Decimal
+    duration_years: int
+    dropoff_rate: Decimal
+    is_included: bool
+    scale_score: Optional[float]
+    scale_answer_count: int
+    suggested_eligible: Optional[bool]
+    calculated_value: Decimal
+
+
+class ProjectSROIRead(BaseModel):
+    project_id: str
+    project_name: str
+    actual_input_cost: Decimal
+    discount_rate: Decimal
+    outcomes: list[OutcomeValuationRead]
+    total_social_value: Decimal
+    sroi_ratio: Optional[Decimal]

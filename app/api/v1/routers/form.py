@@ -302,9 +302,11 @@ def update_form(
     payload: dict = Depends(return_payload),
 ) -> Form:
     form = _get_form(db, form_id, _user_id(payload))
-    for field, value in data.model_dump(exclude_unset=True).items():
+    changes = data.model_dump(exclude_unset=True)
+    is_publish_request = changes.get("status") == FormStatus.PUBLISHED
+    for field, value in changes.items():
         setattr(form, field, value)
-    if form.status == FormStatus.PUBLISHED:
+    if is_publish_request:
         publishable_form = _form_query(db).filter(Form.form_id == form_id).one()
         _validate_form_for_publish(publishable_form)
         _ensure_public_token(form)
