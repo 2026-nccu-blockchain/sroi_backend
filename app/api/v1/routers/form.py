@@ -83,6 +83,8 @@ def _validate_project_outcome(
         return
     query = db.query(Project).join(ProjectOutcome).filter(
         ProjectOutcome.outcome_id == outcome_id,
+        ProjectOutcome.is_delete.is_(False),
+        Project.owner_id == user_id,
         Project.is_delete.is_(False),
     )
     if project_id is not None:
@@ -116,15 +118,24 @@ def _public_form_query(db: Session):
 
 def _cleanup_expired_temporary_questions(db: Session) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    expired = db.query(Question).filter(
-        Question.is_temp.is_(True),
-        Question.create_time < cutoff,
-    ).all()
-    for question in expired:
-        db.delete(question)
-    if expired:
-        db.commit()
-    return len(expired)
+    expired_ids = [
+        question_id
+        for (question_id,) in db.query(Question.question_id).filter(
+            Question.is_temp.is_(True),
+            Question.create_time < cutoff,
+        ).all()
+    ]
+    if not expired_ids:
+        return 0
+    # 過期暫存題目直接實體刪除；model 已無 ORM cascade，所以先刪選項再刪題目
+    db.query(QuestionOption).filter(
+        QuestionOption.question_id.in_(expired_ids),
+    ).delete(synchronize_session=False)
+    db.query(Question).filter(
+        Question.question_id.in_(expired_ids),
+    ).delete(synchronize_session=False)
+    db.commit()
+    return len(expired_ids)
 
 
 def _add_question(
@@ -623,6 +634,7 @@ def check_response_email(
     existing_response = db.query(FormResponse.response_id).filter(
         FormResponse.form_id == form.form_id,
         func.lower(FormResponse.respondent_email) == respondent_email,
+        FormResponse.is_delete.is_(False),
     ).first()
     return RespondentEmailAvailability(can_submit=existing_response is None)
 
@@ -647,6 +659,7 @@ def submit_response(
     existing_response = db.query(FormResponse.response_id).filter(
         FormResponse.form_id == form.form_id,
         func.lower(FormResponse.respondent_email) == respondent_email,
+        FormResponse.is_delete.is_(False),
     ).first()
     if existing_response is not None:
         raise APIException(409, "20016", "這個 Email 已填寫過此表單")
@@ -723,6 +736,10 @@ def list_responses(
 ) -> list[FormResponseRead]:
     _get_form(db, form_id, _user_id(payload), GroupRole.VIEWER)
     responses = db.query(FormResponse).options(
-        selectinload(FormResponse.answers).selectinload(Answer.selected_options)
-    ).filter(FormResponse.form_id == form_id).order_by(FormResponse.submitted_at.desc()).all()
+        selectinload(FormResponse.answers).selectinload(Answer.selected_options),
+        with_loader_criteria(Answer, Answer.is_delete.is_(False)),
+    ).filter(
+        FormResponse.form_id == form_id,
+        FormResponse.is_delete.is_(False),
+    ).order_by(FormResponse.submitted_at.desc()).all()
     return [_serialize_response(response) for response in responses]
