@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
 from typing import Optional
 from app.models.model import GroupRole
@@ -20,7 +20,13 @@ class ChangeRoleRequest(BaseModel):
         return None
 
 class GroupUpdateRequest(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=255)
     desc: str
     begin: datetime
     end: datetime
+
+    @model_validator(mode="after")
+    def check_period(self) -> "GroupUpdateRequest":
+        if self.end < self.begin:
+            raise ValueError("結束時間不可早於開始時間")
+        return self

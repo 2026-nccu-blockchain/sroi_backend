@@ -18,11 +18,11 @@ import re
 router = APIRouter()
 
 
-def check_group_member_role(user_id: str, group_id: str, db: Session = Depends(get_db)):
-    user = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == group_id, GroupAccount.is_delete == False).first()
-    if user is None:
-        return
-    return user.group_role
+def check_group_member_role(db: Session, user_id: str, group_id: str):
+    member = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == group_id, GroupAccount.is_delete == False).first()
+    if member is None:
+        return None
+    return member.group_role
 
 
 @router.post("/invite/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
@@ -238,14 +238,14 @@ def update_group(request: Request, data: GroupUpdateRequest, GroupId: str, db: S
     group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
-    if check_group_member_role(user_id, GroupId) != GroupRole.LEADER:
+    if check_group_member_role(db, user_id, GroupId) != GroupRole.LEADER:
         raise APIException(400, "10008", "permission denied")
     group.title = data.title
     group.desc = data.desc
     group.begin = data.begin
     group.end = data.end
     db.commit()
-    db.refresh()
+    db.refresh(group)
 
     return APIResponse(
         status_code="00000",
@@ -255,4 +255,26 @@ def update_group(request: Request, data: GroupUpdateRequest, GroupId: str, db: S
         desc=group.desc,
         begin=group.begin,
         end=group.end,
+    )
+
+
+@router.delete("/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def delete_group(request: Request, GroupId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    if check_group_member_role(db, user_id, GroupId) != GroupRole.LEADER:
+        raise APIException(400, "10008", "permission denied")
+    group.is_delete = True
+    db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.is_delete == False) \
+        .update({GroupAccount.is_delete: True}, synchronize_session=False)
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
     )
