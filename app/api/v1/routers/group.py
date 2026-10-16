@@ -10,11 +10,19 @@ from app.core.deps import verify_token, return_payload
 from app.core.permissions import count_group_leaders, get_group_members
 from app.schemas.group import (
     InviteRequest,
-    ChangeRoleRequest
+    ChangeRoleRequest,
+    GroupUpdateRequest
 )
 import re
 
 router = APIRouter()
+
+
+def check_group_member_role(user_id: str, group_id: str, db: Session = Depends(get_db)):
+    user = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == group_id, GroupAccount.is_delete == False).first()
+    if user is None:
+        return
+    return user.group_role
 
 
 @router.post("/invite/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
@@ -219,4 +227,32 @@ def group_search_user(request: Request, GroupId: str, Search: str, db: Session =
             }
             for user in users
         ],
+    )
+
+
+@router.put("/update/{GroupId}", response_model=APIResponse, response_model_exclude_none=True)
+def update_group(request: Request, data: GroupUpdateRequest, GroupId: str, db: Session = Depends(get_db)) -> dict:
+    verify_token(request)
+    payload = return_payload(request)
+    user_id = payload["user_id"]
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    if group is None:
+        raise APIException(404, "10013", "group not found")
+    if check_group_member_role(user_id, GroupId) != GroupRole.LEADER:
+        raise APIException(400, "10008", "permission denied")
+    group.title = data.title
+    group.desc = data.desc
+    group.begin = data.begin
+    group.end = data.end
+    db.commit()
+    db.refresh()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        title=group.title,
+        desc=group.desc,
+        begin=group.begin,
+        end=group.end,
     )

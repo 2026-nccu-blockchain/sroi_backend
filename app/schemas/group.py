@@ -18,3 +18,9 @@ class ChangeRoleRequest(BaseModel):
         if self.is_leader is not None:
             return GroupRole.LEADER if self.is_leader else GroupRole.EDITOR
         return None
+
+class GroupUpdateRequest(BaseModel):
+    title: str
+    desc: str
+    begin: datetime
+    end: datetime
