@@ -2,22 +2,31 @@ import io
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+from typing import Literal, Optional
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
-from fastapi import APIRouter, Depends, File, Form as FormField, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form as FormField, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload, with_loader_criteria
 from starlette.concurrency import run_in_threadpool
 
 from app.core.deps import return_payload
 from app.core.exceptions import APIException
+from app.core.permissions import (
+    accessible_project_filter,
+    get_group_role,
+    get_user_group_roles,
+    has_role,
+    require_project_role,
+)
 from app.db.session import get_db
 from app.models.model import (
     Answer,
     Form,
     FormResponse,
     FormStatus,
+    GroupRole,
     Page,
     Project,
     ProjectInterviewFile,
@@ -45,6 +54,7 @@ INTERVIEW_UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "interv
 INTERVIEW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_INTERVIEW_FILE_SIZE = 10 * 1024 * 1024
 READ_CHUNK_SIZE = 1024 * 1024
+NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "actual_input_cost", "begin", "end", "status"}
 MONEY_QUANTUM = Decimal("0.01")
 RATIO_QUANTUM = Decimal("0.0001")
 OUTCOME_ELIGIBILITY_THRESHOLD = Decimal("0.5")
@@ -72,14 +82,13 @@ def _project_query(db: Session):
     )
 
 
-def _owned_project(db: Session, project_id: str, owner_id: str) -> Project:
+def _get_project(db: Session, project_id: str, user_id: str, min_role: GroupRole) -> Project:
     project = _project_query(db).filter(
         Project.project_id == project_id,
-        Project.owner_id == owner_id,
         Project.is_delete.is_(False),
     ).first()
-    if project is None:
-        raise APIException(404, "30001", "Project not found")
+    role = require_project_role(db, project, user_id, min_role)
+    project.my_role = role.value
     return project
 
 
@@ -254,10 +263,10 @@ def _serialize_project_sroi(db: Session, project: Project) -> dict:
 def _validate_stakeholder_forms(
     db: Session,
     items: list[StakeholderInput],
-    owner_id: str,
     project_id: str | None = None,
 ) -> None:
-    """前測、後測表單只能選這個專案底下、未刪除的表單；新建專案時還沒有表單可選。"""
+    """前測、後測表單只能選這個專案底下、未刪除的表單；新建專案時還沒有表單可選。
+    群組專案的表單可能是其他成員建立的，所以不限作者，權限由專案角色控管。"""
     form_ids = {
         form_id
         for item in items
@@ -273,7 +282,6 @@ def _validate_stakeholder_forms(
         for (form_id,) in db.query(Form.form_id).filter(
             Form.form_id.in_(form_ids),
             Form.project_id == project_id,
-            Form.author_id == owner_id,
             Form.is_delete.is_(False),
         ).all()
     }
@@ -292,7 +300,7 @@ def _owned_stakeholder(db: Session, project_id: str, stakeholder_id: str) -> Pro
         ProjectStakeholder.is_delete.is_(False),
     ).first()
     if stakeholder is None:
-        raise APIException(404, "30007", "利害關係人不存在")
+        raise APIException(404, "30009", "利害關係人不存在")
     return stakeholder
 
 
@@ -340,7 +348,6 @@ def _sync_outcomes_to_draft_forms(db: Session, project: Project) -> None:
     """Keep editable forms aligned while treating published forms as snapshots."""
     draft_forms = db.query(Form).filter(
         Form.project_id == project.project_id,
-        Form.author_id == project.owner_id,
         Form.status == FormStatus.DRAFT,
         Form.is_delete.is_(False),
     ).all()
@@ -412,13 +419,29 @@ def _detect_interview_type(data: bytes) -> tuple[str, str] | None:
 
 @router.get("", response_model=list[ProjectRead])
 def list_projects(
+    scope: Literal["all", "personal", "group"] = "all",
+    group_id: Optional[str] = Query(default=None),
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> list[Project]:
-    return _project_query(db).filter(
-        Project.owner_id == _user_id(payload),
+    user_id = _user_id(payload)
+    query = _project_query(db).filter(
+        accessible_project_filter(db, user_id),
         Project.is_delete.is_(False),
-    ).order_by(Project.update_time.desc().nullslast(), Project.create_time.desc()).all()
+    )
+    if scope == "personal":
+        query = query.filter(Project.group_id.is_(None))
+    elif scope == "group":
+        query = query.filter(Project.group_id.isnot(None))
+    if group_id is not None:
+        query = query.filter(Project.group_id == group_id)
+    projects = query.order_by(Project.update_time.desc().nullslast(), Project.create_time.desc()).all()
+
+    group_roles = get_user_group_roles(db, user_id)
+    for project in projects:
+        role = GroupRole.LEADER if project.is_personal else group_roles[project.group_id]
+        project.my_role = role.value
+    return projects
 
 
 @router.post("", response_model=ProjectRead, status_code=status.HTTP_201_CREATED)
@@ -427,10 +450,15 @@ def create_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Project:
-    owner_id = _user_id(payload)
-    _validate_stakeholder_forms(db, data.stakeholders, owner_id)
+    user_id = _user_id(payload)
+    if data.group_id is not None:
+        if not has_role(get_group_role(db, data.group_id, user_id), GroupRole.EDITOR):
+            raise APIException(403, "30007", "Insufficient project permission")
+    _validate_stakeholder_forms(db, data.stakeholders)
     project = Project(
-        owner_id=owner_id,
+        owner_id=user_id if data.group_id is None else None,
+        group_id=data.group_id,
+        created_by=user_id,
         name=data.name,
         organization=data.organization,
         description=data.description,
@@ -444,7 +472,7 @@ def create_project(
     db.add(project)
     db.flush()
     db.commit()
-    return _owned_project(db, project.project_id, owner_id)
+    return _get_project(db, project.project_id, user_id, GroupRole.VIEWER)
 
 
 @router.get("/{project_id}", response_model=ProjectRead)
@@ -453,7 +481,7 @@ def get_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Project:
-    return _owned_project(db, project_id, _user_id(payload))
+    return _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
 
 
 @router.get("/{project_id}/sroi", response_model=ProjectSROIRead)
@@ -462,7 +490,7 @@ def get_project_sroi(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> dict:
-    project = _owned_project(db, project_id, _user_id(payload))
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
     return _serialize_project_sroi(db, project)
 
 
@@ -473,7 +501,8 @@ def save_project_sroi(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> dict:
-    project = _owned_project(db, project_id, _user_id(payload))
+    user_id = _user_id(payload)
+    project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
     active_outcome_ids = {
         outcome.outcome_id
         for outcome in project.outcomes
@@ -511,7 +540,7 @@ def save_project_sroi(
         valuation.is_delete = False
 
     db.commit()
-    project = _owned_project(db, project_id, _user_id(payload))
+    project = _get_project(db, project_id, user_id, GroupRole.VIEWER)
     return _serialize_project_sroi(db, project)
 
 
@@ -522,18 +551,22 @@ def update_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Project:
-    owner_id = _user_id(payload)
-    project = _owned_project(db, project_id, owner_id)
+    user_id = _user_id(payload)
+    project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
     changes = data.model_dump(exclude_unset=True)
     stakeholders = changes.pop("stakeholders", None)
     outcomes = changes.pop("outcomes", None)
+    # exclude_unset 不會排除明確送 null 的欄位，NOT NULL 欄位要先擋掉
+    for field in NON_NULLABLE_PROJECT_FIELDS & changes.keys():
+        if changes[field] is None:
+            raise APIException(400, "30008", f"{field} cannot be null")
     for field, value in changes.items():
         setattr(project, field, value)
     if _as_aware(project.end) < _as_aware(project.begin):
         raise APIException(400, "30008", "結束時間不可早於開始時間")
     if stakeholders is not None:
         stakeholder_items = [StakeholderInput(**item) for item in stakeholders]
-        _validate_stakeholder_forms(db, stakeholder_items, owner_id, project_id)
+        _validate_stakeholder_forms(db, stakeholder_items, project_id)
         _replace_stakeholders(project, stakeholder_items)
     if outcomes is not None:
         _replace_outcomes(
@@ -544,7 +577,7 @@ def update_project(
     if outcomes is not None:
         _sync_outcomes_to_draft_forms(db, project)
     db.commit()
-    return _owned_project(db, project_id, owner_id)
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -553,7 +586,7 @@ def delete_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> None:
-    project = _owned_project(db, project_id, _user_id(payload))
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.LEADER)
     project.is_delete = True
     db.commit()
 
@@ -566,7 +599,7 @@ async def upload_interview_file(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> ProjectInterviewFile:
-    project = _owned_project(db, project_id, _user_id(payload))
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
     stakeholder = _owned_stakeholder(db, project_id, stakeholder_id)
     data = await _read_interview_file(file)
     detected = _detect_interview_type(data)
@@ -597,7 +630,7 @@ def download_interview_file(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> FileResponse:
-    _owned_project(db, project_id, _user_id(payload))
+    _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
     record = db.query(ProjectInterviewFile).filter(
         ProjectInterviewFile.file_id == file_id,
         ProjectInterviewFile.project_id == project_id,
@@ -618,7 +651,7 @@ def delete_interview_file(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> None:
-    _owned_project(db, project_id, _user_id(payload))
+    _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
     record = db.query(ProjectInterviewFile).filter(
         ProjectInterviewFile.file_id == file_id,
         ProjectInterviewFile.project_id == project_id,
