@@ -263,7 +263,8 @@ def delete_group(request: Request, GroupId: str, db: Session = Depends(get_db)) 
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    group = db.query(Group).filter(Group.group_id == GroupId, or_(Group.status == Role.VERIFIED, Group.status == Role.UNVERIFIED), 
+                                   Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
     if check_group_member_role(db, user_id, GroupId) != GroupRole.LEADER:
