@@ -27,13 +27,14 @@ app.add_middleware(
     max_requests=MAX_REQUESTS,
     window_seconds=WINDOW_SECONDS
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 正式環境由 nginx 同網域轉發、開發時由 Vite proxy 轉發，預設不開放跨域
+if settings.cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 @app.exception_handler(APIException)
 async def api_exception_handler(request: Request, exc: APIException):

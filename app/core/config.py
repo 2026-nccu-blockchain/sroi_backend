@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     app_name: str = "FastAPI Starter"
     app_version: str = "0.1.0"
     environment: str = "local"
-    sroi_debug: bool
+    sroi_debug: bool = False
     api_v1_prefix: str = "/api/v1"
     secret_key: str
     jwt_algorithm: str
@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     jwt_expiration_minutes: int 
     max_requests: int
     window_seconds: int
+    # 前後端同網域（nginx 轉發）時不需要；前端在其他網域才填，例如 ["https://app.example.com"]
+    cors_origins: list[str] = []
+    admin_email: str | None = None
+    admin_password: str | None = None
+    admin_name: str = "管理員"
 
     class Config:
         env_file = ".env"
