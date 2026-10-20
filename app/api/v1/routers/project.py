@@ -29,6 +29,7 @@ from app.models.model import (
     GroupRole,
     Page,
     Project,
+    ProjectCost,
     ProjectInterviewFile,
     ProjectOutcome,
     ProjectOutcomeValuation,
@@ -38,8 +39,11 @@ from app.models.model import (
     ResponseStatus,
 )
 from app.schemas.project import (
+    CostCreate,
+    CostUpdate,
     InterviewFileRead,
     OutcomeInput,
+    ProjectCostsRead,
     ProjectCreate,
     ProjectRead,
     ProjectSROIRead,
@@ -54,7 +58,8 @@ INTERVIEW_UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "interv
 INTERVIEW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_INTERVIEW_FILE_SIZE = 10 * 1024 * 1024
 READ_CHUNK_SIZE = 1024 * 1024
-NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "actual_input_cost", "begin", "end", "status"}
+NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "begin", "end", "status"}
+NON_NULLABLE_COST_FIELDS = {"name", "price", "description"}
 MONEY_QUANTUM = Decimal("0.01")
 RATIO_QUANTUM = Decimal("0.0001")
 OUTCOME_ELIGIBILITY_THRESHOLD = Decimal("0.5")
@@ -73,11 +78,13 @@ def _project_query(db: Session):
         selectinload(Project.stakeholders).selectinload(ProjectStakeholder.post_form),
         selectinload(Project.stakeholders).selectinload(ProjectStakeholder.interview_files),
         selectinload(Project.outcomes),
+        selectinload(Project.costs),
         selectinload(Project.interview_files),
         selectinload(Project.forms),
         with_loader_criteria(Form, Form.is_delete.is_(False)),
         with_loader_criteria(ProjectStakeholder, ProjectStakeholder.is_delete.is_(False)),
         with_loader_criteria(ProjectOutcome, ProjectOutcome.is_delete.is_(False)),
+        with_loader_criteria(ProjectCost, ProjectCost.is_delete.is_(False)),
         with_loader_criteria(ProjectInterviewFile, ProjectInterviewFile.is_delete.is_(False)),
     )
 
@@ -304,6 +311,39 @@ def _owned_stakeholder(db: Session, project_id: str, stakeholder_id: str) -> Pro
     return stakeholder
 
 
+def _owned_cost(db: Session, project_id: str, cost_id: str) -> ProjectCost:
+    cost = db.query(ProjectCost).filter(
+        ProjectCost.cost_id == cost_id,
+        ProjectCost.project_id == project_id,
+        ProjectCost.is_delete.is_(False),
+    ).first()
+    if cost is None:
+        raise APIException(404, "30010", "成本項目不存在")
+    return cost
+
+
+def _active_costs(db: Session, project_id: str) -> list[ProjectCost]:
+    return db.query(ProjectCost).filter(
+        ProjectCost.project_id == project_id,
+        ProjectCost.is_delete.is_(False),
+    ).order_by(ProjectCost.position, ProjectCost.create_time).all()
+
+
+def _sync_actual_input_cost(db: Session, project: Project) -> None:
+    """總成本由成本明細加總，存回 actual_input_cost 讓 SROI 計算沿用。"""
+    db.flush()
+    total = sum((_decimal(cost.price) for cost in _active_costs(db, project.project_id)), Decimal("0"))
+    project.actual_input_cost = total.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _serialize_costs(db: Session, project: Project) -> dict:
+    return {
+        "project_id": project.project_id,
+        "costs": _active_costs(db, project.project_id),
+        "total_cost": _decimal(project.actual_input_cost),
+    }
+
+
 def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> None:
     existing = {
         stakeholder.stakeholder_id: stakeholder
@@ -462,7 +502,6 @@ def create_project(
         name=data.name,
         organization=data.organization,
         description=data.description,
-        actual_input_cost=data.actual_input_cost,
         begin=data.begin,
         end=data.end,
         status=data.status,
@@ -512,7 +551,6 @@ def save_project_sroi(
     if not submitted_outcome_ids.issubset(active_outcome_ids):
         raise APIException(400, "30009", "SROI 成果不屬於此專案")
 
-    project.actual_input_cost = data.actual_input_cost
     project.sroi_discount_rate = data.discount_rate
     existing = {
         valuation.outcome_id: valuation
@@ -542,6 +580,76 @@ def save_project_sroi(
     db.commit()
     project = _get_project(db, project_id, user_id, GroupRole.VIEWER)
     return _serialize_project_sroi(db, project)
+
+
+@router.get("/{project_id}/costs", response_model=ProjectCostsRead)
+def list_project_costs(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> dict:
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
+    return _serialize_costs(db, project)
+
+
+@router.post("/{project_id}/costs", response_model=ProjectCostsRead, status_code=status.HTTP_201_CREATED)
+def create_project_cost(
+    project_id: str,
+    data: CostCreate,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> dict:
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
+    position = max((cost.position for cost in _active_costs(db, project_id)), default=-1) + 1
+    db.add(ProjectCost(
+        project_id=project_id,
+        name=data.name.strip(),
+        price=data.price,
+        description=data.description,
+        position=position,
+    ))
+    _sync_actual_input_cost(db, project)
+    db.commit()
+    return _serialize_costs(db, project)
+
+
+@router.patch("/{project_id}/costs/{cost_id}", response_model=ProjectCostsRead)
+def update_project_cost(
+    project_id: str,
+    cost_id: str,
+    data: CostUpdate,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> dict:
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
+    cost = _owned_cost(db, project_id, cost_id)
+    changes = data.model_dump(exclude_unset=True)
+    # exclude_unset 不會排除明確送 null 的欄位，NOT NULL 欄位要先擋掉
+    for field in NON_NULLABLE_COST_FIELDS & changes.keys():
+        if changes[field] is None:
+            raise APIException(400, "30008", f"{field} cannot be null")
+    if "name" in changes:
+        changes["name"] = changes["name"].strip()
+    for field, value in changes.items():
+        setattr(cost, field, value)
+    _sync_actual_input_cost(db, project)
+    db.commit()
+    return _serialize_costs(db, project)
+
+
+@router.delete("/{project_id}/costs/{cost_id}", response_model=ProjectCostsRead)
+def delete_project_cost(
+    project_id: str,
+    cost_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> dict:
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
+    cost = _owned_cost(db, project_id, cost_id)
+    cost.is_delete = True
+    _sync_actual_input_cost(db, project)
+    db.commit()
+    return _serialize_costs(db, project)
 
 
 @router.patch("/{project_id}", response_model=ProjectRead)
