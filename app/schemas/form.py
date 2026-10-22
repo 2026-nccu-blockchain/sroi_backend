@@ -127,6 +127,7 @@ class FormCreate(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     content: str = ""
     status: FormStatus = FormStatus.DRAFT
+    shuffle_outcome_questions: bool = True
     pages: list[PageCreate] = Field(default_factory=lambda: [PageCreate()])
 
 
@@ -134,6 +135,7 @@ class FormUpdate(BaseModel):
     title: Optional[str] = Field(default=None, min_length=1, max_length=255)
     content: Optional[str] = None
     status: Optional[FormStatus] = None
+    shuffle_outcome_questions: Optional[bool] = None
 
 
 class PageStructure(BaseModel):
@@ -153,6 +155,7 @@ class FormRead(ORMModel):
     title: Optional[str]
     content: Optional[str]
     status: FormStatus
+    shuffle_outcome_questions: bool
     create_time: Optional[datetime]
     update_time: Optional[datetime]
     pages: list[PageRead] = Field(default_factory=list)
@@ -162,6 +165,7 @@ class PublicFormRead(ORMModel):
     public_token: str
     title: Optional[str]
     content: Optional[str]
+    shuffle_outcome_questions: bool
     pages: list[PageRead] = Field(default_factory=list)
 
 

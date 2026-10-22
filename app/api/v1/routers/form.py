@@ -219,6 +219,7 @@ def create_form(
         title=data.title,
         content=data.content,
         status=data.status,
+        shuffle_outcome_questions=data.shuffle_outcome_questions,
     )
     if data.status == FormStatus.PUBLISHED:
         _ensure_public_token(form)

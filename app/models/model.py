@@ -144,6 +144,7 @@ class Form(Base):
     title = Column(String(255))
     content = Column(Text)
     status = Column(SQLEnum(FormStatus), nullable=False, default=FormStatus.DRAFT)
+    shuffle_outcome_questions = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     result_id_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
