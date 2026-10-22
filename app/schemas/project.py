@@ -98,7 +98,7 @@ class StakeholderRead(ORMModel):
 
 class ProjectCreate(BaseModel):
     group_id: Optional[str] = None  # 不帶就是個人專案
-    name: str = Field(default=DEFAULT_PROJECT_NAME, max_length=255)
+    name: str = Field(max_length=255)
     organization: str = Field(default="", max_length=255)
     description: str = ""
     begin: datetime
@@ -107,10 +107,14 @@ class ProjectCreate(BaseModel):
     stakeholders: list[StakeholderInput] = Field(default_factory=list)
     outcomes: list[OutcomeInput] = Field(default_factory=list)
 
+    # 新增專案一定要有名稱
     @field_validator("name")
     @classmethod
-    def default_name(cls, value: str) -> str:
-        return value.strip() or DEFAULT_PROJECT_NAME
+    def require_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("請輸入專案名稱")
+        return name
 
     @model_validator(mode="after")
     def check_period(self) -> "ProjectCreate":
