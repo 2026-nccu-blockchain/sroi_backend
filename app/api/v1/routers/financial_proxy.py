@@ -47,6 +47,7 @@ def list_proxies(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ):
+
     return (
         db.query(FinancialProxy)
         .filter(
@@ -56,6 +57,7 @@ def list_proxies(
         .order_by(FinancialProxy.create_time.desc())
         .all()
     )
+
 
 
 @router.post("", response_model=ProxyRead, status_code=status.HTTP_201_CREATED)

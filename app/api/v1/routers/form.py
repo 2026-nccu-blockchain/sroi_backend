@@ -2,13 +2,14 @@ from datetime import datetime, timedelta, timezone
 import secrets
 
 from fastapi import APIRouter, Depends, status, Request
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
 from app.core.deps import return_payload
 from app.core.exceptions import APIException
+from app.core.permissions import accessible_project_filter, require_form_role, require_project_role
 from app.db.session import get_db
 from app.models.model import (
     Answer,
@@ -16,7 +17,10 @@ from app.models.model import (
     Form,
     FormResponse,
     FormStatus,
+    GroupRole,
     Page,
+    Project,
+    ProjectOutcome,
     Question,
     QuestionOption,
     QuestionType,
@@ -51,15 +55,43 @@ def _user_id(payload: dict) -> str:
     return str(user_id)
 
 
-def _owned_form(db: Session, form_id: str, user_id: str) -> Form:
+def _get_form(db: Session, form_id: str, user_id: str, min_role: GroupRole = GroupRole.EDITOR) -> Form:
     form = db.query(Form).filter(
         Form.form_id == form_id,
-        Form.author_id == user_id,
         Form.is_delete.is_(False),
     ).first()
-    if form is None:
-        raise APIException(404, "20001", "Form not found")
+    require_form_role(db, form, user_id, min_role)
     return form
+
+
+def _get_project(db: Session, project_id: str, user_id: str, min_role: GroupRole) -> Project:
+    project = db.query(Project).filter(
+        Project.project_id == project_id,
+        Project.is_delete.is_(False),
+    ).first()
+    require_project_role(db, project, user_id, min_role)
+    return project
+
+
+def _validate_project_outcome(
+    db: Session,
+    outcome_id: str | None,
+    user_id: str,
+    project_id: str | None = None,
+) -> None:
+    if outcome_id is None:
+        return
+    query = db.query(Project).join(ProjectOutcome).filter(
+        ProjectOutcome.outcome_id == outcome_id,
+        ProjectOutcome.is_delete.is_(False),
+        Project.is_delete.is_(False),
+    )
+    if project_id is not None:
+        query = query.filter(ProjectOutcome.project_id == project_id)
+    project = query.first()
+    if project is None:
+        raise APIException(400, "30003", "Project outcome does not belong to this user")
+    require_project_role(db, project, user_id, GroupRole.EDITOR)
 
 
 def _form_query(db: Session):
@@ -85,15 +117,24 @@ def _public_form_query(db: Session):
 
 def _cleanup_expired_temporary_questions(db: Session) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-    expired = db.query(Question).filter(
-        Question.is_temp.is_(True),
-        Question.create_time < cutoff,
-    ).all()
-    for question in expired:
-        db.delete(question)
-    if expired:
-        db.commit()
-    return len(expired)
+    expired_ids = [
+        question_id
+        for (question_id,) in db.query(Question.question_id).filter(
+            Question.is_temp.is_(True),
+            Question.create_time < cutoff,
+        ).all()
+    ]
+    if not expired_ids:
+        return 0
+    # 過期暫存題目直接實體刪除；model 已無 ORM cascade，所以先刪選項再刪題目
+    db.query(QuestionOption).filter(
+        QuestionOption.question_id.in_(expired_ids),
+    ).delete(synchronize_session=False)
+    db.query(Question).filter(
+        Question.question_id.in_(expired_ids),
+    ).delete(synchronize_session=False)
+    db.commit()
+    return len(expired_ids)
 
 
 def _add_question(
@@ -143,6 +184,8 @@ def _validate_form_for_publish(form: Form) -> None:
     active_pages = [page for page in form.pages if not page.is_delete]
     if not active_pages:
         raise APIException(400, "20027", "At least one block is required before publishing")
+    if not any(page.is_respondent_info for page in active_pages):
+        raise APIException(400, "20032", "Respondent information block is required before publishing")
     for page in active_pages:
         if not page.title or not page.title.strip():
             raise APIException(400, "20028", "Every block needs a title before publishing")
@@ -150,10 +193,10 @@ def _validate_form_for_publish(form: Form) -> None:
             question for question in page.questions
             if not question.is_delete and not question.is_temp
         ]
-        if not any(question.question_type != QuestionType.DS for question in active_questions):
+        if not page.is_respondent_info and not any(question.question_type != QuestionType.DS for question in active_questions):
             raise APIException(400, "20029", f"Block has no answerable question: {page.page_id}")
         for question in active_questions:
-            question_text = question.content if question.question_type == QuestionType.DS else question.title
+            question_text = (question.title or question.content) if question.question_type == QuestionType.DS else question.title
             if not question_text or not question_text.strip():
                 raise APIException(400, "20030", f"Question is incomplete: {question.question_id}")
             if question.question_type == QuestionType.CQ:
@@ -168,16 +211,27 @@ def create_form(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Form:
+    user_id = _user_id(payload)
+    _get_project(db, data.project_id, user_id, GroupRole.EDITOR)
     form = Form(
-        author_id=_user_id(payload),
+        author_id=user_id,
+        project_id=data.project_id,
         title=data.title,
         content=data.content,
         status=data.status,
+        shuffle_outcome_questions=data.shuffle_outcome_questions,
     )
     if data.status == FormStatus.PUBLISHED:
         _ensure_public_token(form)
+    if sum(page.is_respondent_info for page in data.pages) > 1:
+        raise APIException(400, "20033", "A form can only have one respondent information block")
     for page_data in data.pages:
+        if page_data.is_respondent_info and page_data.project_outcome_id is not None:
+            raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
+        _validate_project_outcome(db, page_data.project_outcome_id, user_id, data.project_id)
         page = Page(
+            project_outcome_id=page_data.project_outcome_id,
+            is_respondent_info=page_data.is_respondent_info,
             title=page_data.title,
             content=page_data.content,
             position=page_data.position,
@@ -204,8 +258,16 @@ def list_forms(
     payload: dict = Depends(return_payload),
 ) -> list[Form]:
     _cleanup_expired_temporary_questions(db)
+    user_id = _user_id(payload)
+    accessible_project_ids = db.query(Project.project_id).filter(
+        accessible_project_filter(db, user_id),
+        Project.is_delete.is_(False),
+    )
     return _form_query(db).filter(
-        Form.author_id == _user_id(payload),
+        or_(
+            and_(Form.project_id.is_(None), Form.author_id == user_id),
+            Form.project_id.in_(accessible_project_ids),
+        ),
         Form.is_delete.is_(False),
     ).order_by(Form.create_time.desc()).all()
 
@@ -217,7 +279,7 @@ def get_form(
     payload: dict = Depends(return_payload),
 ) -> Form:
     _cleanup_expired_temporary_questions(db)
-    _owned_form(db, form_id, _user_id(payload))
+    _get_form(db, form_id, _user_id(payload), GroupRole.VIEWER)
     return _form_query(db).filter(Form.form_id == form_id).one()
 
 
@@ -240,10 +302,12 @@ def update_form(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Form:
-    form = _owned_form(db, form_id, _user_id(payload))
-    for field, value in data.model_dump(exclude_unset=True).items():
+    form = _get_form(db, form_id, _user_id(payload))
+    changes = data.model_dump(exclude_unset=True)
+    is_publish_request = changes.get("status") == FormStatus.PUBLISHED
+    for field, value in changes.items():
         setattr(form, field, value)
-    if form.status == FormStatus.PUBLISHED:
+    if is_publish_request:
         publishable_form = _form_query(db).filter(Form.form_id == form_id).one()
         _validate_form_for_publish(publishable_form)
         _ensure_public_token(form)
@@ -259,7 +323,7 @@ def save_form_structure(
     payload: dict = Depends(return_payload),
 ) -> Form:
     """Finalize temporary questions and build the default linked-list order."""
-    form = _owned_form(db, form_id, _user_id(payload))
+    form = _get_form(db, form_id, _user_id(payload))
     active_pages = db.query(Page).filter(
         Page.form_id == form_id,
         Page.is_delete.is_(False),
@@ -312,7 +376,7 @@ def delete_form(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> None:
-    form = _owned_form(db, form_id, _user_id(payload))
+    form = _get_form(db, form_id, _user_id(payload))
     form.is_delete = True
     db.commit()
 
@@ -324,8 +388,27 @@ def create_page(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Page:
-    form = _owned_form(db, form_id, _user_id(payload))
-    page = Page(form=form, title=data.title, content=data.content, position=data.position)
+    user_id = _user_id(payload)
+    form = _get_form(db, form_id, user_id)
+    if data.is_respondent_info:
+        existing = db.query(Page.page_id).filter(
+            Page.form_id == form_id,
+            Page.is_respondent_info.is_(True),
+            Page.is_delete.is_(False),
+        ).first()
+        if existing is not None:
+            raise APIException(400, "20033", "A form can only have one respondent information block")
+        if data.project_outcome_id is not None:
+            raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
+    _validate_project_outcome(db, data.project_outcome_id, user_id, form.project_id)
+    page = Page(
+        form=form,
+        project_outcome_id=data.project_outcome_id,
+        is_respondent_info=data.is_respondent_info,
+        title=data.title,
+        content=data.content,
+        position=data.position,
+    )
     for question_data in data.questions:
         _add_question(form, page, question_data)
     db.add(page)
@@ -341,15 +424,30 @@ def update_page(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Page:
+    user_id = _user_id(payload)
     page = db.query(Page).join(Form).filter(
         Page.page_id == page_id,
         Page.is_delete.is_(False),
-        Form.author_id == _user_id(payload),
         Form.is_delete.is_(False),
     ).first()
     if page is None:
         raise APIException(404, "20002", "Page not found")
-    for field, value in data.model_dump(exclude_unset=True).items():
+    require_form_role(db, page.form, user_id, GroupRole.EDITOR)
+    changes = data.model_dump(exclude_unset=True)
+    if changes.get("is_respondent_info"):
+        duplicate = db.query(Page.page_id).filter(
+            Page.form_id == page.form_id,
+            Page.page_id != page.page_id,
+            Page.is_respondent_info.is_(True),
+            Page.is_delete.is_(False),
+        ).first()
+        if duplicate is not None:
+            raise APIException(400, "20033", "A form can only have one respondent information block")
+        if changes.get("project_outcome_id", page.project_outcome_id) is not None:
+            raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
+    if "project_outcome_id" in changes:
+        _validate_project_outcome(db, changes["project_outcome_id"], user_id, page.form.project_id)
+    for field, value in changes.items():
         setattr(page, field, value)
     db.commit()
     db.refresh(page)
@@ -365,11 +463,11 @@ def delete_page(
     page = db.query(Page).options(selectinload(Page.questions)).join(Form).filter(
         Page.page_id == page_id,
         Page.is_delete.is_(False),
-        Form.author_id == _user_id(payload),
         Form.is_delete.is_(False),
     ).first()
     if page is None:
         raise APIException(404, "20002", "Page not found")
+    require_form_role(db, page.form, _user_id(payload), GroupRole.EDITOR)
     active_page_count = db.query(Page).filter(
         Page.form_id == page.form_id,
         Page.is_delete.is_(False),
@@ -391,7 +489,7 @@ def create_question(
     payload: dict = Depends(return_payload),
 ) -> Question:
     _cleanup_expired_temporary_questions(db)
-    form = _owned_form(db, form_id, _user_id(payload))
+    form = _get_form(db, form_id, _user_id(payload))
     page = db.query(Page).filter(
         Page.page_id == page_id,
         Page.form_id == form_id,
@@ -416,11 +514,11 @@ def update_question(
     question = db.query(Question).options(selectinload(Question.options)).join(Form).filter(
         Question.question_id == question_id,
         Question.is_delete.is_(False),
-        Form.author_id == _user_id(payload),
         Form.is_delete.is_(False),
     ).first()
     if question is None:
         raise APIException(404, "20003", "Question not found")
+    require_form_role(db, question.form, _user_id(payload), GroupRole.EDITOR)
 
     changes = data.model_dump(exclude_unset=True)
     option_data = changes.pop("options", None)
@@ -431,8 +529,10 @@ def update_question(
     if question.question_type == QuestionType.SC:
         if question.scale_begin is None or question.scale_end is None:
             raise APIException(400, "20016", "Scale question requires scale_begin and scale_end")
-        if question.scale_begin >= question.scale_end:
-            raise APIException(400, "20017", "scale_begin must be smaller than scale_end")
+        if question.scale_begin != 1:
+            raise APIException(400, "20017", "Scale questions must start at 1")
+        if question.scale_end not in {3, 5, 7, 9}:
+            raise APIException(400, "20018", "Scale size must be 3, 5, 7, or 9")
     if question.question_type != QuestionType.CQ:
         for option in question.options:
             option.is_delete = True
@@ -474,11 +574,12 @@ def delete_question(
 ) -> None:
     question = db.query(Question).join(Form).filter(
         Question.question_id == question_id,
-        Form.author_id == _user_id(payload),
         Question.is_delete.is_(False),
+        Form.is_delete.is_(False),
     ).first()
     if question is None:
         raise APIException(404, "20003", "Question not found")
+    require_form_role(db, question.form, _user_id(payload), GroupRole.EDITOR)
     question.is_delete = True
     db.commit()
 
@@ -535,6 +636,7 @@ def check_response_email(
     existing_response = db.query(FormResponse.response_id).filter(
         FormResponse.form_id == form.form_id,
         func.lower(FormResponse.respondent_email) == respondent_email,
+        FormResponse.is_delete.is_(False),
     ).first()
     return RespondentEmailAvailability(can_submit=existing_response is None)
 
@@ -559,6 +661,7 @@ def submit_response(
     existing_response = db.query(FormResponse.response_id).filter(
         FormResponse.form_id == form.form_id,
         func.lower(FormResponse.respondent_email) == respondent_email,
+        FormResponse.is_delete.is_(False),
     ).first()
     if existing_response is not None:
         raise APIException(409, "20016", "這個 Email 已填寫過此表單")
@@ -633,8 +736,12 @@ def list_responses(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> list[FormResponseRead]:
-    _owned_form(db, form_id, _user_id(payload))
+    _get_form(db, form_id, _user_id(payload), GroupRole.VIEWER)
     responses = db.query(FormResponse).options(
-        selectinload(FormResponse.answers).selectinload(Answer.selected_options)
-    ).filter(FormResponse.form_id == form_id).order_by(FormResponse.submitted_at.desc()).all()
+        selectinload(FormResponse.answers).selectinload(Answer.selected_options),
+        with_loader_criteria(Answer, Answer.is_delete.is_(False)),
+    ).filter(
+        FormResponse.form_id == form_id,
+        FormResponse.is_delete.is_(False),
+    ).order_by(FormResponse.submitted_at.desc()).all()
     return [_serialize_response(response) for response in responses]

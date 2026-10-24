@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Request, Depends
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models.model import Role, Account, VerifiedInProgress, Group
+from app.models.model import Role, GroupRole, Account, VerifiedInProgress, Group, GroupAccount
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
@@ -101,12 +101,15 @@ def add_group(request: Request, data: AddGroupRequest, db: Session = Depends(get
         begin=data.begin,
         end=data.end,
         status=Role.IN_PROGRESS,
-        leader_list=[f"{user_id}"]
     )
     db.add(new_group)
-    db.commit()
-    db.refresh(new_group)
-    user.group_list = (user.group_list or []) + [f"{new_group.group_id}"]
+    db.flush()
+    # 申請人直接成為組長；權限判斷只採計 VERIFIED 群組，審核通過前不會生效
+    db.add(GroupAccount(
+        group_id=new_group.group_id,
+        user_id=user_id,
+        group_role=GroupRole.LEADER
+    ))
     db.commit()
 
     return APIResponse(
@@ -126,17 +129,11 @@ def my_group(request: Request, db: Session = Depends(get_db)) -> dict:
         raise APIException(404, "10001", "user not found")
     if user.role == Role.UNVERIFIED or user.role == Role.IN_PROGRESS:
         raise APIException(400, "10008", "permission denied")
-    group_list = user.group_list
-    if not group_list:
-        return APIResponse(
-            status_code="00000",
-            message="success",
-            response_datetime=datetime.now(),
-            verified_groups=[],
-            in_progress_groups=[],
-            unverified_groups=[],
-        )
-    groups = db.query(Group).filter(Group.group_id.in_(group_list)).all()
+    groups = db.query(Group).join(GroupAccount, GroupAccount.group_id == Group.group_id).filter(
+        GroupAccount.user_id == user_id,
+        GroupAccount.is_delete == False,
+        Group.is_delete == False,
+    ).all()
     verified_group = []
     in_progress_group = []
     unverified_group = []
