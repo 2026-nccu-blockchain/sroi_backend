@@ -204,6 +204,11 @@ class Project(Base):
         foreign_keys="Form.project_id",
         order_by="Form.create_time.desc()",
     )
+    costs = relationship(
+        "ProjectCost",
+        back_populates="project",
+        order_by="ProjectCost.position",
+    )
     stakeholders = relationship(
         "ProjectStakeholder",
         back_populates="project",
@@ -224,6 +229,22 @@ class Project(Base):
     @property
     def is_personal(self) -> bool:
         return self.group_id is None
+
+
+class ProjectCost(Base):
+    __tablename__ = "project_costs"
+
+    cost_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    price = Column(Numeric(14, 2), nullable=False, default=0)
+    description = Column(Text, nullable=False, default="")
+    position = Column(Integer, nullable=False, default=0)
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    project = relationship("Project", back_populates="costs")
 
 
 class ProjectStakeholder(Base):
