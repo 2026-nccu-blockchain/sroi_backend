@@ -129,16 +129,28 @@ class OutcomeValuationInput(BaseModel):
     is_included: bool = True
 
 
-class ProjectSROIUpdate(BaseModel):
-    actual_input_cost: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
-    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
+class StakeholderValuationInput(BaseModel):
+    stakeholder_id: str
     outcomes: list[OutcomeValuationInput] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def check_unique_outcomes(self) -> "ProjectSROIUpdate":
+    def check_unique_outcomes(self) -> "StakeholderValuationInput":
         outcome_ids = [item.outcome_id for item in self.outcomes]
         if len(outcome_ids) != len(set(outcome_ids)):
-            raise ValueError("成果不可重複")
+            raise ValueError("同一位利害關係人的成果不可重複")
+        return self
+
+
+class ProjectSROIUpdate(BaseModel):
+    actual_input_cost: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
+    stakeholders: list[StakeholderValuationInput] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def check_unique_items(self) -> "ProjectSROIUpdate":
+        stakeholder_ids = [item.stakeholder_id for item in self.stakeholders]
+        if len(stakeholder_ids) != len(set(stakeholder_ids)):
+            raise ValueError("利害關係人不可重複")
         return self
 
 
@@ -160,11 +172,21 @@ class OutcomeValuationRead(BaseModel):
     calculated_value: Decimal
 
 
+class StakeholderSROIRead(BaseModel):
+    stakeholder_id: str
+    stakeholder_name: str
+    stakeholder_role: str
+    position: int
+    outcomes: list[OutcomeValuationRead]
+    total_social_value: Decimal
+    sroi_ratio: Optional[Decimal]
+
+
 class ProjectSROIRead(BaseModel):
     project_id: str
     project_name: str
     actual_input_cost: Decimal
     discount_rate: Decimal
-    outcomes: list[OutcomeValuationRead]
+    stakeholders: list[StakeholderSROIRead]
     total_social_value: Decimal
     sroi_ratio: Optional[Decimal]
