@@ -144,6 +144,7 @@ class Form(Base):
     title = Column(String(255))
     content = Column(Text)
     status = Column(SQLEnum(FormStatus), nullable=False, default=FormStatus.DRAFT)
+    shuffle_outcome_questions = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     result_id_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -203,6 +204,11 @@ class Project(Base):
         foreign_keys="Form.project_id",
         order_by="Form.create_time.desc()",
     )
+    costs = relationship(
+        "ProjectCost",
+        back_populates="project",
+        order_by="ProjectCost.position",
+    )
     stakeholders = relationship(
         "ProjectStakeholder",
         back_populates="project",
@@ -223,6 +229,22 @@ class Project(Base):
     @property
     def is_personal(self) -> bool:
         return self.group_id is None
+
+
+class ProjectCost(Base):
+    __tablename__ = "project_costs"
+
+    cost_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    price = Column(Numeric(14, 2), nullable=False, default=0)
+    description = Column(Text, nullable=False, default="")
+    position = Column(Integer, nullable=False, default=0)
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    project = relationship("Project", back_populates="costs")
 
 
 class ProjectStakeholder(Base):
@@ -256,6 +278,7 @@ class ProjectStakeholder(Base):
         back_populates="stakeholder",
         order_by="ProjectInterviewFile.create_time",
     )
+    outcome_valuations = relationship("ProjectOutcomeValuation", back_populates="stakeholder")
 
 
 class ProjectOutcome(Base):
@@ -271,15 +294,22 @@ class ProjectOutcome(Base):
 
     project = relationship("Project", back_populates="outcomes")
     form_pages = relationship("Page", back_populates="project_outcome")
-    valuation = relationship("ProjectOutcomeValuation", back_populates="outcome", uselist=False)
+    valuations = relationship("ProjectOutcomeValuation", back_populates="outcome")
 
 
 class ProjectOutcomeValuation(Base):
     __tablename__ = "project_outcome_valuations"
-    __table_args__ = (UniqueConstraint("outcome_id", name="uq_project_outcome_valuation_outcome"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "stakeholder_id",
+            "outcome_id",
+            name="uq_project_outcome_valuation_stakeholder_outcome",
+        ),
+    )
 
     valuation_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    stakeholder_id = Column(String(36), ForeignKey("project_stakeholders.stakeholder_id", ondelete="CASCADE"), nullable=True, index=True)
     outcome_id = Column(String(36), ForeignKey("project_outcomes.outcome_id", ondelete="CASCADE"), nullable=False, index=True)
     quantity = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
     financial_proxy_value = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
@@ -294,7 +324,8 @@ class ProjectOutcomeValuation(Base):
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     project = relationship("Project", back_populates="outcome_valuations")
-    outcome = relationship("ProjectOutcome", back_populates="valuation")
+    stakeholder = relationship("ProjectStakeholder", back_populates="outcome_valuations")
+    outcome = relationship("ProjectOutcome", back_populates="valuations")
 
 
 class ProjectInterviewFile(Base):

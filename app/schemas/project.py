@@ -2,9 +2,12 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.model import FormStatus, GroupRole
+
+
+DEFAULT_PROJECT_NAME = "未命名的專案"
 
 
 class ORMModel(BaseModel):
@@ -37,6 +40,34 @@ class OutcomeRead(ORMModel):
     position: int
 
 
+class CostCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    price: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
+    description: str = ""
+
+
+class CostUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    price: Optional[Decimal] = Field(default=None, ge=0, max_digits=14, decimal_places=2)
+    description: Optional[str] = None
+
+
+class CostRead(ORMModel):
+    cost_id: str
+    name: str
+    price: Decimal
+    description: str
+    position: int
+    create_time: Optional[datetime]
+    update_time: Optional[datetime]
+
+
+class ProjectCostsRead(BaseModel):
+    project_id: str
+    costs: list[CostRead]
+    total_cost: Decimal
+
+
 class InterviewFileRead(ORMModel):
     file_id: str
     stakeholder_id: str
@@ -67,15 +98,19 @@ class StakeholderRead(ORMModel):
 
 class ProjectCreate(BaseModel):
     group_id: Optional[str] = None  # 不帶就是個人專案
-    name: str = Field(min_length=1, max_length=255)
+    name: str = Field(default=DEFAULT_PROJECT_NAME, max_length=255)
     organization: str = Field(default="", max_length=255)
     description: str = ""
-    actual_input_cost: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
     begin: datetime
     end: datetime
     status: Literal["draft", "published"] = "draft"
     stakeholders: list[StakeholderInput] = Field(default_factory=list)
     outcomes: list[OutcomeInput] = Field(default_factory=list)
+
+    @field_validator("name")
+    @classmethod
+    def default_name(cls, value: str) -> str:
+        return value.strip() or DEFAULT_PROJECT_NAME
 
     @model_validator(mode="after")
     def check_period(self) -> "ProjectCreate":
@@ -85,15 +120,20 @@ class ProjectCreate(BaseModel):
 
 
 class ProjectUpdate(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    name: Optional[str] = Field(default=None, max_length=255)
     organization: Optional[str] = Field(default=None, max_length=255)
     description: Optional[str] = None
-    actual_input_cost: Optional[Decimal] = Field(default=None, ge=0, max_digits=14, decimal_places=2)
     begin: Optional[datetime] = None
     end: Optional[datetime] = None
     status: Optional[Literal["draft", "published"]] = None
     stakeholders: Optional[list[StakeholderInput]] = None
     outcomes: Optional[list[OutcomeInput]] = None
+
+    # 明確送 null 仍交給 router 擋，只把空白名稱換成預設值
+    @field_validator("name")
+    @classmethod
+    def default_name(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else value.strip() or DEFAULT_PROJECT_NAME
 
 
 class ProjectRead(ORMModel):
@@ -112,6 +152,7 @@ class ProjectRead(ORMModel):
     forms: list[LinkedFormRead] = Field(default_factory=list)
     stakeholders: list[StakeholderRead] = Field(default_factory=list)
     outcomes: list[OutcomeRead] = Field(default_factory=list)
+    costs: list[CostRead] = Field(default_factory=list)
     interview_files: list[InterviewFileRead] = Field(default_factory=list)
     create_time: Optional[datetime]
     update_time: Optional[datetime]
@@ -129,16 +170,28 @@ class OutcomeValuationInput(BaseModel):
     is_included: bool = True
 
 
-class ProjectSROIUpdate(BaseModel):
-    actual_input_cost: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
-    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
+class StakeholderValuationInput(BaseModel):
+    stakeholder_id: str
     outcomes: list[OutcomeValuationInput] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def check_unique_outcomes(self) -> "ProjectSROIUpdate":
+    def check_unique_outcomes(self) -> "StakeholderValuationInput":
         outcome_ids = [item.outcome_id for item in self.outcomes]
         if len(outcome_ids) != len(set(outcome_ids)):
-            raise ValueError("成果不可重複")
+            raise ValueError("同一位利害關係人的成果不可重複")
+        return self
+
+
+class ProjectSROIUpdate(BaseModel):
+    actual_input_cost: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
+    stakeholders: list[StakeholderValuationInput] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def check_unique_items(self) -> "ProjectSROIUpdate":
+        stakeholder_ids = [item.stakeholder_id for item in self.stakeholders]
+        if len(stakeholder_ids) != len(set(stakeholder_ids)):
+            raise ValueError("利害關係人不可重複")
         return self
 
 
@@ -160,11 +213,21 @@ class OutcomeValuationRead(BaseModel):
     calculated_value: Decimal
 
 
+class StakeholderSROIRead(BaseModel):
+    stakeholder_id: str
+    stakeholder_name: str
+    stakeholder_role: str
+    position: int
+    outcomes: list[OutcomeValuationRead]
+    total_social_value: Decimal
+    sroi_ratio: Optional[Decimal]
+
+
 class ProjectSROIRead(BaseModel):
     project_id: str
     project_name: str
     actual_input_cost: Decimal
     discount_rate: Decimal
-    outcomes: list[OutcomeValuationRead]
+    stakeholders: list[StakeholderSROIRead]
     total_social_value: Decimal
     sroi_ratio: Optional[Decimal]
