@@ -117,7 +117,7 @@ def send_verification_code_email(*, recipient_email: str, code: str, expire_minu
     html_content = template.substitute(code=escape(code), expire_minutes=expire_minutes)
     return send_html_email(
         recipient_email=recipient_email,
-        recipient_name=recipient_email, 
+        recipient_name="使用者", 
         subject="社會影響力評估平台註冊驗證碼",
         html_content=html_content,
     )
