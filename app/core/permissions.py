@@ -2,7 +2,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import APIException
-from app.models.model import Account, Form, Group, GroupAccount, GroupRole, Project, Role
+from app.models.model import Account, Form, Group, GroupAccount, GroupRole, GroupStatus, Project
 
 
 ROLE_LEVEL = {GroupRole.VIEWER: 1, GroupRole.EDITOR: 2, GroupRole.LEADER: 3}
@@ -17,7 +17,7 @@ def _active_membership_query(db: Session, user_id: str):
     return db.query(GroupAccount).join(Group, Group.group_id == GroupAccount.group_id).filter(
         GroupAccount.user_id == user_id,
         GroupAccount.is_delete.is_(False),
-        Group.status == Role.VERIFIED,
+        Group.status == GroupStatus.VERIFIED,
         Group.is_delete.is_(False),
     )
 

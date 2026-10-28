@@ -61,7 +61,7 @@ def user_register(data: RegisterRequest, db: Session = Depends(get_db)) -> dict:
         email=data.email,
         hash_password=" ", #不能是null，下面才會設密碼,
         name=data.name,
-        role=Role.UNVERIFIED
+        role=Role.NORMAL
     )
     new_account.set_password(data.password)
     db.add(new_account)
