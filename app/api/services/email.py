@@ -111,37 +111,13 @@ def send_html_email(
     return response.message_id
 
 
-def render_student_verification_email(
-    *,
-    recipient_name: str,
-    verification_url: str,
-) -> str:
-    parsed_url = urlparse(verification_url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-        raise ValueError("verification_url 必須是完整的 http 或 https 網址")
-
-    template_path = EMAIL_TEMPLATE_DIR / "nccu_student_verification.html"
-    template = Template(template_path.read_text(encoding="utf-8"))
-    return template.substitute(
-        recipient_name=escape(recipient_name),
-        verification_url=escape(verification_url, quote=True),
-    )
-
-
-def send_student_verification_email(
-    *,
-    recipient_email: str,
-    recipient_name: str,
-    verification_url: str,
-) -> str:
-    """寄送政大學生身分認證信；是否寄送由呼叫端決定。"""
-    html_content = render_student_verification_email(
-        recipient_name=recipient_name,
-        verification_url=verification_url,
-    )
+def send_verification_code_email(*, recipient_email: str, code: str, expire_minutes: int) -> str:
+    """寄送註冊驗證碼；信中只有驗證碼，沒有任何連結"""
+    template = Template((EMAIL_TEMPLATE_DIR / "verification_code.html").read_text(encoding="utf-8"))
+    html_content = template.substitute(code=escape(code), expire_minutes=expire_minutes)
     return send_html_email(
         recipient_email=recipient_email,
-        recipient_name=recipient_name,
-        subject="請完成政大學生身分認證",
+        recipient_name=recipient_email, 
+        subject="社會影響力評估平台註冊驗證碼",
         html_content=html_content,
     )
