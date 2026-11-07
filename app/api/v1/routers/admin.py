@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Request, Depends
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from app.db.session import get_db
 from app.models.model import Role, GroupRole, GroupStatus, Account, VerifiedInProgress, Group, GroupAccount
 from app.core.exceptions import APIException
@@ -244,7 +244,8 @@ def show_all_groups(request: Request, db: Session = Depends(get_db)) -> dict:
         raise APIException(404, "10001", "user not found")
     if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")    
-    all_groups = db.query(Group).filter(Group.is_delete == False).all()
+    # 一次載入建立者，避免每個群組各查一次
+    all_groups = db.query(Group).options(selectinload(Group.creator)).filter(Group.is_delete == False).all()
     agree_groups = []
     in_progress_groups = []
     disagree_groups = []
@@ -256,6 +257,12 @@ def show_all_groups(request: Request, db: Session = Depends(get_db)) -> dict:
         elif group.status == GroupStatus.UNVERIFIED:
             disagree_groups.append(group)
 
+    def creator_of(group: Group) -> dict | None:
+        creator = group.creator
+        if creator is None:
+            return None
+        return {"user_id": creator.user_id, "campus_id": creator.campus_id, "name": creator.name}
+
     return APIResponse(
         status_code="00000",
         message="success",
@@ -266,7 +273,8 @@ def show_all_groups(request: Request, db: Session = Depends(get_db)) -> dict:
                 "title": ag.title,
                 "desc": ag.desc,
                 "begin": ag.begin,
-                "end": ag.end
+                "end": ag.end,
+                "creator": creator_of(ag)
             }
             for ag in agree_groups
         ],
@@ -276,7 +284,8 @@ def show_all_groups(request: Request, db: Session = Depends(get_db)) -> dict:
                 "title": ipg.title,
                 "desc": ipg.desc,
                 "begin": ipg.begin,
-                "end": ipg.end
+                "end": ipg.end,
+                "creator": creator_of(ipg)
             }
             for ipg in in_progress_groups
         ],
@@ -287,7 +296,8 @@ def show_all_groups(request: Request, db: Session = Depends(get_db)) -> dict:
                 "desc": dg.desc,
                 "begin": dg.begin,
                 "end": dg.end,
-                "reason": dg.reason
+                "reason": dg.reason,
+                "creator": creator_of(dg)
             }
             for dg in disagree_groups
         ],

@@ -129,11 +129,14 @@ class Group(Base):
     end = Column(DateTime(timezone=True), nullable=False)
     status = Column(SQLEnum(GroupStatus), nullable=False)
     reason = Column(Text, nullable=True)
+    # 建立（申請）群組的人；舊資料由遷移回填，查不到成員紀錄的舊群組會是空值
+    created_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=True, index=True)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     projects = relationship("Project", back_populates="group")
+    creator = relationship("Account", foreign_keys=[created_by])
 
 
 class GroupAccount(Base):
