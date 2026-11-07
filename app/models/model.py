@@ -11,13 +11,14 @@ import re
 
 
 class Role(Enum):
-    ADMIN = "admin"
-    DB_EDITOR = "db_editor"
+    ADMIN = "admin"           # 管理員
+    DB_EDITOR = "db_editor"   # 資料庫編輯者
+    NORMAL = "normal"         # 一般使用者
+
+class GroupStatus(Enum):
     VERIFIED = "verified"
     IN_PROGRESS = "in_progress"
     UNVERIFIED = "unverified"
-    LEADER = "leader"
-    MEMBER = "member"
 
 class GroupRole(Enum):
     LEADER = "leader"   # 組長：管理成員、刪除專案、編輯內容
@@ -41,6 +42,10 @@ class ResponseStatus(Enum):
     SUBMITTED = "submitted"
 
 
+# email 欄位只存 @ 前面的部分，寄信時才補上網域
+EMAIL_DOMAIN = "@nccu.edu.tw"
+
+
 class Account(Base):
     __tablename__ = "accounts"
 
@@ -50,7 +55,6 @@ class Account(Base):
     hash_password = Column(String(255), nullable=False)
     name = Column(String(20), nullable=False)
     role = Column(SQLEnum(Role), nullable=False)
-    id_card_link = Column(String(255))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
@@ -70,11 +74,18 @@ class Account(Base):
         return re.match(email_regex, email) is not None
 
     @staticmethod
+    def verify_email_prefix(prefix: str) -> bool:
+        return re.match(r'^[a-zA-Z0-9._%+-]+$', prefix) is not None
+
+    @property
+    def mail_address(self) -> str:
+        # 舊資料可能已經是完整 email，就不再補網域
+        return self.email if "@" in self.email else self.email + EMAIL_DOMAIN
+
+    @staticmethod
     def campus_id_taken(db, campus_id: str, exclude_user_id: Optional[str] = None) -> bool:
-        # 已審核通過（已驗證、資料庫編輯者、管理員）的帳號佔用中的學號
         query = db.query(Account).filter(
             Account.campus_id == campus_id,
-            Account.role.notin_([Role.UNVERIFIED, Role.IN_PROGRESS]),
             Account.is_delete == False,
         )
         if exclude_user_id is not None:
@@ -82,14 +93,27 @@ class Account(Base):
         return query.first() is not None
 
 
+class VerifiedCode(Base):
+    __tablename__ = "verified_codes"
+
+    uuid = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    email = Column(String(255), nullable=False, index=True)
+    code_hash = Column(String(64), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)  # 輸入錯誤的次數
+    is_verified = Column(Boolean, nullable=False, default=False)
+    is_delete = Column(Boolean, nullable=False, default=False)  # 重寄、過期、錯太多次時作廢
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 class VerifiedInProgress(Base):
     __tablename__ = "verified_in_progress"
 
+    # 學號變更申請
     uuid  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    is_ver = Column(Boolean, nullable=False) # 是認證還是更改
     campus_id = Column(String(36), nullable=False) # 教職員編號、學號
     user_id = Column(String(36), nullable=False)
-    id_card_link = Column(String(255), nullable=False)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
@@ -103,7 +127,7 @@ class Group(Base):
     desc = Column(Text, nullable=False)
     begin = Column(DateTime(timezone=True), nullable=False)
     end = Column(DateTime(timezone=True), nullable=False)
-    status = Column(SQLEnum(Role), nullable=False)
+    status = Column(SQLEnum(GroupStatus), nullable=False)
     reason = Column(Text, nullable=True)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())

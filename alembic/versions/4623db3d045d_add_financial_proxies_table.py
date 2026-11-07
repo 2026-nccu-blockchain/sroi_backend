@@ -20,6 +20,10 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # 另一個分支的 e4f5a6b7c8d9 也可能已經建過這張表
+    if sa.inspect(op.get_bind()).has_table("financial_proxies"):
+        return
+
     op.create_table(
         "financial_proxies",
         sa.Column(
