@@ -1,4 +1,5 @@
 import io
+import shutil
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.api.services.interview_files import (
     INTERVIEW_UPLOAD_DIR,
     discard_temp_interview_file,
     load_temp_interview_file,
+    move_interview_file_to_deleted,
     promote_temp_interview_file,
     save_temp_interview_file,
 )
@@ -729,6 +731,8 @@ def update_project(
     if _as_aware(project.end) < _as_aware(project.begin):
         raise APIException(400, "30008", "結束時間不可早於開始時間")
     promotions: list[dict] = []
+    # 移除檔案或整個利害關係人都會讓訪綱變成刪除，記下原本有效的檔案來比對
+    active_file_ids = {record.file_id for record in project.interview_files if not record.is_delete}
     if stakeholders is not None:
         stakeholder_items = [StakeholderUpdateInput(**item) for item in stakeholders]
         _validate_stakeholder_forms(db, stakeholder_items, project_id)
@@ -746,16 +750,27 @@ def update_project(
     if outcomes is not None:
         _sync_outcomes_to_draft_forms(db, project)
 
-    # 暫存檔先複製到正式資料夾再提交，失敗就把複製出來的檔案刪掉
+    deleted_files = [
+        record for record in project.interview_files
+        if record.is_delete and record.file_id in active_file_ids
+    ]
+
+    # 檔案先處理再提交：暫存檔複製到正式資料夾、刪除的檔案移到刪除資料夾；失敗就全部還原
     promoted: list[Path] = []
+    moved: list[tuple[Path, Path]] = []
     try:
         for meta in promotions:
             promoted.append(promote_temp_interview_file(meta, meta["stored_name"]))
+        for record in deleted_files:
+            if result := move_interview_file_to_deleted(record.stored_name):
+                moved.append(result)
         db.commit()
     except Exception:
         db.rollback()
         for target in promoted:
             target.unlink(missing_ok=True)
+        for source, target in moved:
+            shutil.move(target, source)
         raise
     for meta in promotions:
         discard_temp_interview_file(meta)

@@ -12,7 +12,7 @@ from app.core.exceptions import APIException
 from app.schemas.common import ErrorResponse
 from app.core.middleware import CustomHeaderMiddleware, RateLimitMiddleware
 from app.api.v1.router import api_router
-from app.api.services.interview_files import run_temp_interview_cleanup
+from app.api.services.interview_files import run_interview_file_maintenance
 
 
 settings = get_settings()
@@ -22,10 +22,10 @@ WINDOW_SECONDS=settings.window_seconds
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 定期清除沒有儲存的暫存訪綱檔案
-    cleanup = asyncio.create_task(run_temp_interview_cleanup())
+    # 定期清除沒有儲存的暫存訪綱、壓縮已刪除的訪綱
+    maintenance = asyncio.create_task(run_interview_file_maintenance())
     yield
-    cleanup.cancel()
+    maintenance.cancel()
 
 
 app = FastAPI(
