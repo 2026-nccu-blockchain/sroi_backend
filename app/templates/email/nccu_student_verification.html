@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>請完成政大學生身分認證</title>
+  </head>
+  <body style="margin:0;background:#f5f1f7;color:#241b29;font-family:Arial,'Noto Sans TC',sans-serif;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f5f1f7;padding:32px 16px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:600px;background:#ffffff;border:1px solid #e3d9e8;">
+            <tr>
+              <td style="padding:24px 32px;background:#765292;color:#ffffff;">
+                <p style="margin:0;font-size:12px;font-weight:700;letter-spacing:2px;">SROI</p>
+                <h1 style="margin:10px 0 0;font-size:24px;line-height:1.4;">政大學生身分認證</h1>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:32px;">
+                <p style="margin:0 0 18px;font-size:16px;line-height:1.8;">你好，$recipient_name：</p>
+                <p style="margin:0 0 18px;font-size:15px;line-height:1.8;color:#554b5a;">
+                  為了確認你的政大學生身分，請點擊下方按鈕前往認證頁面，並依畫面指示完成資料確認。
+                </p>
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:28px 0;">
+                  <tr>
+                    <td style="background:#765292;">
+                      <a href="$verification_url" style="display:inline-block;padding:13px 24px;color:#ffffff;font-size:15px;font-weight:700;text-decoration:none;">
+                        前往學生身分認證
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin:0 0 8px;font-size:13px;line-height:1.7;color:#756b79;">
+                  若按鈕無法開啟，請複製以下網址到瀏覽器：
+                </p>
+                <p style="margin:0;padding:12px;background:#f7f3f9;font-size:12px;line-height:1.7;word-break:break-all;">
+                  <a href="$verification_url" style="color:#68447f;">$verification_url</a>
+                </p>
+                <p style="margin:24px 0 0;font-size:12px;line-height:1.7;color:#8a808e;">
+                  如果你沒有提出這項認證申請，可以忽略此信件。
+                </p>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:18px 32px;border-top:1px solid #eee6f1;color:#8a808e;font-size:11px;line-height:1.6;">
+                此信件由 SROI 系統自動寄出，請勿直接回覆。
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

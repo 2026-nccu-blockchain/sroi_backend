@@ -137,10 +137,11 @@ def _outcome_scale_metrics(
     db: Session,
     project_id: str,
     outcome_ids: set[str],
+    form_ids: set[str] | None = None,
 ) -> dict[str, tuple[float, int]]:
     if not outcome_ids:
         return {}
-    rows = db.query(
+    query = db.query(
         Page.project_outcome_id,
         Answer.number_value,
         Question.scale_begin,
@@ -170,7 +171,12 @@ def _outcome_scale_metrics(
         FormResponse.status == ResponseStatus.SUBMITTED,
         FormResponse.is_duplicate_legacy.is_(False),
         FormResponse.is_delete.is_(False),
-    ).all()
+    )
+    if form_ids is not None:
+        if not form_ids:
+            return {}
+        query = query.filter(Form.form_id.in_(form_ids))
+    rows = query.all()
 
     scores: dict[str, list[Decimal]] = {outcome_id: [] for outcome_id in outcome_ids}
     for outcome_id, number_value, scale_begin, scale_end in rows:
@@ -191,77 +197,119 @@ def _serialize_project_sroi(db: Session, project: Project) -> dict:
         (outcome for outcome in project.outcomes if not outcome.is_delete),
         key=lambda outcome: outcome.position,
     )
+    stakeholders = sorted(
+        (stakeholder for stakeholder in project.stakeholders if not stakeholder.is_delete),
+        key=lambda stakeholder: stakeholder.position,
+    )
     outcome_ids = {outcome.outcome_id for outcome in outcomes}
     valuations = {
-        valuation.outcome_id: valuation
+        (valuation.stakeholder_id, valuation.outcome_id): valuation
         for valuation in db.query(ProjectOutcomeValuation).filter(
             ProjectOutcomeValuation.project_id == project.project_id,
             ProjectOutcomeValuation.outcome_id.in_(outcome_ids) if outcome_ids else False,
             ProjectOutcomeValuation.is_delete.is_(False),
         ).all()
     }
-    scale_metrics = _outcome_scale_metrics(db, project.project_id, outcome_ids)
-    discount_rate = _decimal(project.sroi_discount_rate, "0.035")
-    serialized_outcomes: list[dict] = []
-    total_social_value = Decimal("0")
-    has_missing_proxy = False
+    actual_input_cost = _decimal(project.actual_input_cost).quantize(
+        MONEY_QUANTUM,
+        rounding=ROUND_HALF_UP,
+    )
 
-    for outcome in outcomes:
-        valuation = valuations.get(outcome.outcome_id)
-        quantity = _decimal(valuation.quantity if valuation else None)
-        financial_proxy_value = _decimal(valuation.financial_proxy_value if valuation else None)
-        deadweight_rate = _decimal(valuation.deadweight_rate if valuation else None)
-        attribution_rate = _decimal(valuation.attribution_rate if valuation else None)
-        displacement_rate = _decimal(valuation.displacement_rate if valuation else None)
-        duration_years = valuation.duration_years if valuation else 1
-        dropoff_rate = _decimal(valuation.dropoff_rate if valuation else None)
-        is_included = valuation.is_included if valuation else True
-        calculated_value = _outcome_value(
-            quantity=quantity,
-            financial_proxy_value=financial_proxy_value,
-            deadweight_rate=deadweight_rate,
-            attribution_rate=attribution_rate,
-            displacement_rate=displacement_rate,
-            duration_years=duration_years,
-            dropoff_rate=dropoff_rate,
-            discount_rate=discount_rate,
-            is_included=is_included,
+    discount_rate = _decimal(project.sroi_discount_rate, "0.035")
+    serialized_stakeholders: list[dict] = []
+    total_social_value = Decimal("0")
+    project_has_missing_proxy = False
+    stakeholder_ratios: list[Decimal] = []
+
+    for stakeholder in stakeholders:
+        linked_form_ids = {
+            form_id for form_id in (stakeholder.pre_form_id, stakeholder.post_form_id) if form_id
+        }
+        scale_metrics = _outcome_scale_metrics(
+            db,
+            project.project_id,
+            outcome_ids,
+            linked_form_ids,
         )
-        total_social_value += calculated_value
-        if is_included and financial_proxy_value <= 0:
-            has_missing_proxy = True
-        metric = scale_metrics.get(outcome.outcome_id)
-        scale_score = metric[0] if metric else None
-        answer_count = metric[1] if metric else 0
-        serialized_outcomes.append({
-            "outcome_id": outcome.outcome_id,
-            "outcome_name": outcome.name,
-            "position": outcome.position,
-            "quantity": quantity,
-            "financial_proxy_value": financial_proxy_value,
-            "deadweight_rate": deadweight_rate,
-            "attribution_rate": attribution_rate,
-            "displacement_rate": displacement_rate,
-            "duration_years": duration_years,
-            "dropoff_rate": dropoff_rate,
-            "is_included": is_included,
-            "scale_score": scale_score,
-            "scale_answer_count": answer_count,
-            "suggested_eligible": scale_score > float(OUTCOME_ELIGIBILITY_THRESHOLD) if scale_score is not None else None,
-            "calculated_value": calculated_value,
+        serialized_outcomes: list[dict] = []
+        stakeholder_social_value = Decimal("0")
+        stakeholder_has_missing_proxy = False
+
+        for outcome in outcomes:
+            valuation = valuations.get((stakeholder.stakeholder_id, outcome.outcome_id))
+            quantity = _decimal(valuation.quantity if valuation else None)
+            financial_proxy_value = _decimal(valuation.financial_proxy_value if valuation else None)
+            deadweight_rate = _decimal(valuation.deadweight_rate if valuation else None)
+            attribution_rate = _decimal(valuation.attribution_rate if valuation else None)
+            displacement_rate = _decimal(valuation.displacement_rate if valuation else None)
+            duration_years = valuation.duration_years if valuation else 1
+            dropoff_rate = _decimal(valuation.dropoff_rate if valuation else None)
+            is_included = valuation.is_included if valuation else True
+            calculated_value = _outcome_value(
+                quantity=quantity,
+                financial_proxy_value=financial_proxy_value,
+                deadweight_rate=deadweight_rate,
+                attribution_rate=attribution_rate,
+                displacement_rate=displacement_rate,
+                duration_years=duration_years,
+                dropoff_rate=dropoff_rate,
+                discount_rate=discount_rate,
+                is_included=is_included,
+            )
+            stakeholder_social_value += calculated_value
+            if is_included and financial_proxy_value <= 0:
+                stakeholder_has_missing_proxy = True
+            metric = scale_metrics.get(outcome.outcome_id)
+            scale_score = metric[0] if metric else None
+            answer_count = metric[1] if metric else 0
+            serialized_outcomes.append({
+                "outcome_id": outcome.outcome_id,
+                "outcome_name": outcome.name,
+                "position": outcome.position,
+                "quantity": quantity,
+                "financial_proxy_value": financial_proxy_value,
+                "deadweight_rate": deadweight_rate,
+                "attribution_rate": attribution_rate,
+                "displacement_rate": displacement_rate,
+                "duration_years": duration_years,
+                "dropoff_rate": dropoff_rate,
+                "is_included": is_included,
+                "scale_score": scale_score,
+                "scale_answer_count": answer_count,
+                "suggested_eligible": scale_score > float(OUTCOME_ELIGIBILITY_THRESHOLD) if scale_score is not None else None,
+                "calculated_value": calculated_value,
+            })
+
+        stakeholder_social_value = stakeholder_social_value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+        stakeholder_ratio = None
+        if actual_input_cost > 0 and not stakeholder_has_missing_proxy:
+            stakeholder_ratio = (stakeholder_social_value / actual_input_cost).quantize(
+                RATIO_QUANTUM,
+                rounding=ROUND_HALF_UP,
+            )
+            stakeholder_ratios.append(stakeholder_ratio)
+        project_has_missing_proxy = project_has_missing_proxy or stakeholder_has_missing_proxy
+        total_social_value += stakeholder_social_value
+        serialized_stakeholders.append({
+            "stakeholder_id": stakeholder.stakeholder_id,
+            "stakeholder_name": stakeholder.name,
+            "stakeholder_role": stakeholder.role,
+            "position": stakeholder.position,
+            "outcomes": serialized_outcomes,
+            "total_social_value": stakeholder_social_value,
+            "sroi_ratio": stakeholder_ratio,
         })
 
-    actual_input_cost = _decimal(project.actual_input_cost)
     total_social_value = total_social_value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
     sroi_ratio = None
-    if actual_input_cost > 0 and not has_missing_proxy:
-        sroi_ratio = (total_social_value / actual_input_cost).quantize(RATIO_QUANTUM, rounding=ROUND_HALF_UP)
+    if actual_input_cost > 0 and stakeholders and not project_has_missing_proxy:
+        sroi_ratio = sum(stakeholder_ratios, Decimal("0")).quantize(RATIO_QUANTUM, rounding=ROUND_HALF_UP)
     return {
         "project_id": project.project_id,
         "project_name": project.name,
         "actual_input_cost": actual_input_cost,
         "discount_rate": discount_rate,
-        "outcomes": serialized_outcomes,
+        "stakeholders": serialized_stakeholders,
         "total_social_value": total_social_value,
         "sroi_ratio": sroi_ratio,
     }
@@ -542,40 +590,63 @@ def save_project_sroi(
 ) -> dict:
     user_id = _user_id(payload)
     project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
+    active_stakeholder_ids = {
+        stakeholder.stakeholder_id
+        for stakeholder in project.stakeholders
+        if not stakeholder.is_delete
+    }
     active_outcome_ids = {
         outcome.outcome_id
         for outcome in project.outcomes
         if not outcome.is_delete
     }
-    submitted_outcome_ids = {item.outcome_id for item in data.outcomes}
+    submitted_stakeholder_ids = {item.stakeholder_id for item in data.stakeholders}
+    if not submitted_stakeholder_ids.issubset(active_stakeholder_ids):
+        raise APIException(400, "30010", "SROI 利害關係人不屬於此專案")
+    submitted_outcome_ids = {
+        outcome.outcome_id
+        for stakeholder in data.stakeholders
+        for outcome in stakeholder.outcomes
+    }
     if not submitted_outcome_ids.issubset(active_outcome_ids):
         raise APIException(400, "30009", "SROI 成果不屬於此專案")
 
     project.sroi_discount_rate = data.discount_rate
-    existing = {
-        valuation.outcome_id: valuation
+
+    project.actual_input_cost = data.actual_input_cost
+
+    existing_valuations = {
+        (valuation.stakeholder_id, valuation.outcome_id): valuation
         for valuation in db.query(ProjectOutcomeValuation).filter(
             ProjectOutcomeValuation.project_id == project_id,
-            ProjectOutcomeValuation.outcome_id.in_(submitted_outcome_ids) if submitted_outcome_ids else False,
         ).all()
     }
-    for item in data.outcomes:
-        valuation = existing.get(item.outcome_id)
-        if valuation is None:
-            valuation = ProjectOutcomeValuation(
-                project_id=project_id,
-                outcome_id=item.outcome_id,
-            )
-            db.add(valuation)
-        valuation.quantity = item.quantity
-        valuation.financial_proxy_value = item.financial_proxy_value
-        valuation.deadweight_rate = item.deadweight_rate
-        valuation.attribution_rate = item.attribution_rate
-        valuation.displacement_rate = item.displacement_rate
-        valuation.duration_years = item.duration_years
-        valuation.dropoff_rate = item.dropoff_rate
-        valuation.is_included = item.is_included
-        valuation.is_delete = False
+    retained_valuation_ids: set[str] = set()
+    for stakeholder_item in data.stakeholders:
+        for item in stakeholder_item.outcomes:
+            key = (stakeholder_item.stakeholder_id, item.outcome_id)
+            valuation = existing_valuations.get(key)
+            if valuation is None:
+                valuation = ProjectOutcomeValuation(
+                    project_id=project_id,
+                    stakeholder_id=stakeholder_item.stakeholder_id,
+                    outcome_id=item.outcome_id,
+                )
+                db.add(valuation)
+                db.flush()
+            valuation.quantity = item.quantity
+            valuation.financial_proxy_value = item.financial_proxy_value
+            valuation.deadweight_rate = item.deadweight_rate
+            valuation.attribution_rate = item.attribution_rate
+            valuation.displacement_rate = item.displacement_rate
+            valuation.duration_years = item.duration_years
+            valuation.dropoff_rate = item.dropoff_rate
+            valuation.is_included = item.is_included
+            valuation.is_delete = False
+            retained_valuation_ids.add(valuation.valuation_id)
+    for valuation in existing_valuations.values():
+        if valuation.valuation_id not in retained_valuation_ids:
+            valuation.is_delete = True
 
     db.commit()
     project = _get_project(db, project_id, user_id, GroupRole.VIEWER)

@@ -12,3 +12,4 @@ python-multipart
 pillow
 pillow-heif
 pip-audit
+sib-api-v3-sdk
