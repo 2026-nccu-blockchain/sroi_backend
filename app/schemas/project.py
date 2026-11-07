@@ -43,20 +43,23 @@ class OutcomeRead(ORMModel):
 class CostCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     price: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
-    description: str = ""
+    quantity: int = Field(default=1, ge=1)
+    funding_source: str = Field(default="", max_length=255)
 
 
 class CostUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=255)
     price: Optional[Decimal] = Field(default=None, ge=0, max_digits=14, decimal_places=2)
-    description: Optional[str] = None
+    quantity: Optional[int] = Field(default=None, ge=1)
+    funding_source: Optional[str] = Field(default=None, max_length=255)
 
 
 class CostRead(ORMModel):
     cost_id: str
     name: str
     price: Decimal
-    description: str
+    quantity: int
+    funding_source: str
     position: int
     create_time: Optional[datetime]
     update_time: Optional[datetime]

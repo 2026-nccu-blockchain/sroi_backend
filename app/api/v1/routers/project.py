@@ -59,7 +59,7 @@ INTERVIEW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_INTERVIEW_FILE_SIZE = 10 * 1024 * 1024
 READ_CHUNK_SIZE = 1024 * 1024
 NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "begin", "end", "status"}
-NON_NULLABLE_COST_FIELDS = {"name", "price", "description"}
+NON_NULLABLE_COST_FIELDS = {"name", "price", "quantity", "funding_source"}
 MONEY_QUANTUM = Decimal("0.01")
 RATIO_QUANTUM = Decimal("0.0001")
 OUTCOME_ELIGIBILITY_THRESHOLD = Decimal("0.5")
@@ -378,9 +378,12 @@ def _active_costs(db: Session, project_id: str) -> list[ProjectCost]:
 
 
 def _sync_actual_input_cost(db: Session, project: Project) -> None:
-    """總成本由成本明細加總，存回 actual_input_cost 讓 SROI 計算沿用。"""
+    """總成本由成本明細（金額 × 個數）加總，存回 actual_input_cost 讓 SROI 計算沿用。"""
     db.flush()
-    total = sum((_decimal(cost.price) for cost in _active_costs(db, project.project_id)), Decimal("0"))
+    total = sum(
+        (_decimal(cost.price) * cost.quantity for cost in _active_costs(db, project.project_id)),
+        Decimal("0"),
+    )
     project.actual_input_cost = total.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
 
 
@@ -676,7 +679,8 @@ def create_project_cost(
         project_id=project_id,
         name=data.name.strip(),
         price=data.price,
-        description=data.description,
+        quantity=data.quantity,
+        funding_source=data.funding_source.strip(),
         position=position,
     ))
     _sync_actual_input_cost(db, project)
@@ -699,8 +703,9 @@ def update_project_cost(
     for field in NON_NULLABLE_COST_FIELDS & changes.keys():
         if changes[field] is None:
             raise APIException(400, "30008", f"{field} cannot be null")
-    if "name" in changes:
-        changes["name"] = changes["name"].strip()
+    for field in ("name", "funding_source"):
+        if field in changes:
+            changes[field] = changes[field].strip()
     for field, value in changes.items():
         setattr(cost, field, value)
     _sync_actual_input_cost(db, project)
