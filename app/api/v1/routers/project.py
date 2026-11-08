@@ -197,15 +197,43 @@ def _outcome_scale_metrics(
     }
 
 
-def _serialize_project_sroi(db: Session, project: Project) -> dict:
-    outcomes = sorted(
-        (outcome for outcome in project.outcomes if not outcome.is_delete),
-        key=lambda outcome: outcome.position,
-    )
-    stakeholders = sorted(
+def _active_stakeholders(project: Project) -> list[ProjectStakeholder]:
+    return sorted(
         (stakeholder for stakeholder in project.stakeholders if not stakeholder.is_delete),
         key=lambda stakeholder: stakeholder.position,
     )
+
+
+def _ordered_outcomes(project: Project) -> list[ProjectOutcome]:
+    """依「利害關係人順序 → 成果順序」排列；沒有指定利害關係人的舊成果排最前面。"""
+    stakeholder_positions = {
+        stakeholder.stakeholder_id: stakeholder.position
+        for stakeholder in _active_stakeholders(project)
+    }
+    return sorted(
+        (
+            outcome for outcome in project.outcomes
+            if not outcome.is_delete
+            and (outcome.stakeholder_id is None or outcome.stakeholder_id in stakeholder_positions)
+        ),
+        key=lambda outcome: (
+            -1 if outcome.stakeholder_id is None else stakeholder_positions[outcome.stakeholder_id],
+            outcome.position,
+        ),
+    )
+
+
+def _outcomes_of(outcomes: list[ProjectOutcome], stakeholder_id: str) -> list[ProjectOutcome]:
+    """利害關係人自己的成果，加上沒有指定利害關係人的舊成果（視為共用）。"""
+    return [
+        outcome for outcome in outcomes
+        if outcome.stakeholder_id is None or outcome.stakeholder_id == stakeholder_id
+    ]
+
+
+def _serialize_project_sroi(db: Session, project: Project) -> dict:
+    outcomes = _ordered_outcomes(project)
+    stakeholders = _active_stakeholders(project)
     outcome_ids = {outcome.outcome_id for outcome in outcomes}
     valuations = {
         (valuation.stakeholder_id, valuation.outcome_id): valuation
@@ -227,20 +255,21 @@ def _serialize_project_sroi(db: Session, project: Project) -> dict:
     stakeholder_ratios: list[Decimal] = []
 
     for stakeholder in stakeholders:
+        stakeholder_outcomes = _outcomes_of(outcomes, stakeholder.stakeholder_id)
         linked_form_ids = {
             form_id for form_id in (stakeholder.pre_form_id, stakeholder.post_form_id) if form_id
         }
         scale_metrics = _outcome_scale_metrics(
             db,
             project.project_id,
-            outcome_ids,
+            {outcome.outcome_id for outcome in stakeholder_outcomes},
             linked_form_ids,
         )
         serialized_outcomes: list[dict] = []
         stakeholder_social_value = Decimal("0")
         stakeholder_has_missing_proxy = False
 
-        for outcome in outcomes:
+        for outcome in stakeholder_outcomes:
             valuation = valuations.get((stakeholder.stakeholder_id, outcome.outcome_id))
             quantity = _decimal(valuation.quantity if valuation else None)
             financial_proxy_value = _decimal(valuation.financial_proxy_value if valuation else None)
@@ -298,7 +327,7 @@ def _serialize_project_sroi(db: Session, project: Project) -> dict:
         serialized_stakeholders.append({
             "stakeholder_id": stakeholder.stakeholder_id,
             "stakeholder_name": stakeholder.name,
-            "stakeholder_role": stakeholder.role,
+            "stakeholder_role": stakeholder.stakeholder_type,
             "position": stakeholder.position,
             "outcomes": serialized_outcomes,
             "total_social_value": stakeholder_social_value,
@@ -379,7 +408,8 @@ def _serialize_costs(db: Session, project: Project) -> dict:
 
 
 def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> list[ProjectStakeholder]:
-    """回傳與 items 同順序的利害關係人，讓後續步驟對應新建立的項目。"""
+    """回傳與 items 同順序的利害關係人，讓後續步驟對應新建立的項目。
+    被移除的利害關係人，他的訪綱、成果、成本一起標記刪除。"""
     existing = {
         stakeholder.stakeholder_id: stakeholder
         for stakeholder in project.stakeholders
@@ -392,7 +422,8 @@ def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> li
             stakeholder = ProjectStakeholder()
             project.stakeholders.append(stakeholder)
         stakeholder.name = item.name
-        stakeholder.role = item.role
+        stakeholder.relation = item.relation.strip()
+        stakeholder.stakeholder_type = item.stakeholder_type.strip()
         stakeholder.notes = item.notes
         stakeholder.pre_form_id = item.pre_form_id
         stakeholder.post_form_id = item.post_form_id
@@ -402,23 +433,52 @@ def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> li
         stakeholder.is_delete = True
         for record in stakeholder.interview_files:
             record.is_delete = True
+        for outcome in stakeholder.outcomes:
+            outcome.is_delete = True
+        for cost in stakeholder.costs:
+            cost.is_delete = True
     return result
 
 
-def _replace_costs(project: Project, items: list[CostInput]) -> None:
-    existing = {cost.cost_id: cost for cost in project.costs if not cost.is_delete}
+def _apply_stakeholder_children(
+    project: Project,
+    items: list[StakeholderInput],
+    stakeholders: list[ProjectStakeholder],
+) -> tuple[bool, bool]:
+    """依各利害關係人底下的 outcomes / costs 取代他的成果與成本；回傳（成果有沒有送、成本有沒有送）。"""
+    outcomes_sent = costs_sent = False
+    for item, stakeholder in zip(items, stakeholders):
+        if item.outcomes is not None:
+            outcomes_sent = True
+            _replace_outcomes(project, stakeholder, item.outcomes)
+        if item.costs is not None:
+            costs_sent = True
+            _replace_costs(project, stakeholder, item.costs)
+    return outcomes_sent, costs_sent
+
+
+def _replace_costs(project: Project, stakeholder: ProjectStakeholder, items: list[CostInput]) -> None:
+    # 只動這位利害關係人的成本；沒有指定利害關係人的舊成本也可以被認領
+    existing = {
+        cost.cost_id: cost
+        for cost in project.costs
+        if not cost.is_delete and (cost.stakeholder is stakeholder or (cost.stakeholder is None and cost.stakeholder_id is None))
+    }
+    owned = {cost_id for cost_id, cost in existing.items() if cost.stakeholder is stakeholder}
     for position, item in enumerate(items):
         cost = existing.pop(item.cost_id, None) if item.cost_id else None
         if cost is None:
             cost = ProjectCost()
             project.costs.append(cost)
+        cost.stakeholder = stakeholder
         cost.name = item.name.strip()
         cost.price = item.price
         cost.quantity = item.quantity
         cost.funding_source = item.funding_source.strip()
         cost.position = position
-    for cost in existing.values():
-        cost.is_delete = True
+    for cost_id, cost in existing.items():
+        if cost_id in owned:
+            cost.is_delete = True
 
 
 def _apply_interview_files(
@@ -460,21 +520,25 @@ def _apply_interview_files(
     return promotions
 
 
-def _replace_outcomes(project: Project, items: list[OutcomeInput]) -> None:
+def _replace_outcomes(project: Project, stakeholder: ProjectStakeholder, items: list[OutcomeInput]) -> None:
+    # 只動這位利害關係人的成果；沒有指定利害關係人的舊成果也可以被認領
     existing = {
         outcome.outcome_id: outcome
         for outcome in project.outcomes
-        if not outcome.is_delete
+        if not outcome.is_delete and (outcome.stakeholder is stakeholder or (outcome.stakeholder is None and outcome.stakeholder_id is None))
     }
+    owned = {outcome_id for outcome_id, outcome in existing.items() if outcome.stakeholder is stakeholder}
     for position, item in enumerate(items):
         outcome = existing.pop(item.outcome_id, None) if item.outcome_id else None
         if outcome is None:
             outcome = ProjectOutcome()
             project.outcomes.append(outcome)
+        outcome.stakeholder = stakeholder
         outcome.name = item.name.strip()
         outcome.position = position
-    for outcome in existing.values():
-        outcome.is_delete = True
+    for outcome_id, outcome in existing.items():
+        if outcome_id in owned:
+            outcome.is_delete = True
 
 
 def _sync_outcomes_to_draft_forms(db: Session, project: Project) -> None:
@@ -496,10 +560,7 @@ def _sync_outcomes_to_draft_forms(db: Session, project: Project) -> None:
             if page.project_outcome_id is not None
         }
 
-        active_outcomes = sorted(
-            (outcome for outcome in project.outcomes if not outcome.is_delete),
-            key=lambda outcome: outcome.position,
-        )
+        active_outcomes = _ordered_outcomes(project)
         ordered_outcome_pages: list[Page] = []
         for outcome in active_outcomes:
             page = pages_by_outcome.get(outcome.outcome_id)
@@ -599,10 +660,12 @@ def create_project(
         end=data.end,
         status=data.status,
     )
-    _replace_stakeholders(project, data.stakeholders)
-    _replace_outcomes(project, data.outcomes)
+    saved_stakeholders = _replace_stakeholders(project, data.stakeholders)
+    _, costs_sent = _apply_stakeholder_children(project, data.stakeholders, saved_stakeholders)
     db.add(project)
     db.flush()
+    if costs_sent:
+        _sync_actual_input_cost(db, project)
     db.commit()
     return _get_project(db, project.project_id, user_id, GroupRole.VIEWER)
 
@@ -640,21 +703,15 @@ def save_project_sroi(
         for stakeholder in project.stakeholders
         if not stakeholder.is_delete
     }
-    active_outcome_ids = {
-        outcome.outcome_id
-        for outcome in project.outcomes
-        if not outcome.is_delete
-    }
     submitted_stakeholder_ids = {item.stakeholder_id for item in data.stakeholders}
     if not submitted_stakeholder_ids.issubset(active_stakeholder_ids):
         raise APIException(400, "30010", "SROI 利害關係人不屬於此專案")
-    submitted_outcome_ids = {
-        outcome.outcome_id
-        for stakeholder in data.stakeholders
-        for outcome in stakeholder.outcomes
-    }
-    if not submitted_outcome_ids.issubset(active_outcome_ids):
-        raise APIException(400, "30009", "SROI 成果不屬於此專案")
+    # 每位利害關係人只能估值自己的成果（或沒有指定利害關係人的舊成果）
+    outcomes = _ordered_outcomes(project)
+    for stakeholder_item in data.stakeholders:
+        allowed_ids = {outcome.outcome_id for outcome in _outcomes_of(outcomes, stakeholder_item.stakeholder_id)}
+        if not {outcome.outcome_id for outcome in stakeholder_item.outcomes}.issubset(allowed_ids):
+            raise APIException(400, "30009", "SROI 成果不屬於此利害關係人")
 
     project.sroi_discount_rate = data.discount_rate
 
@@ -720,8 +777,6 @@ def update_project(
     project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
     changes = data.model_dump(exclude_unset=True)
     stakeholders = changes.pop("stakeholders", None)
-    outcomes = changes.pop("outcomes", None)
-    costs = changes.pop("costs", None)
     # exclude_unset 不會排除明確送 null 的欄位，NOT NULL 欄位要先擋掉
     for field in NON_NULLABLE_PROJECT_FIELDS & changes.keys():
         if changes[field] is None:
@@ -738,17 +793,12 @@ def update_project(
         _validate_stakeholder_forms(db, stakeholder_items, project_id)
         saved_stakeholders = _replace_stakeholders(project, stakeholder_items)
         promotions = _apply_interview_files(db, project, stakeholder_items, saved_stakeholders)
-    if outcomes is not None:
-        _replace_outcomes(
-            project,
-            [OutcomeInput(**item) for item in outcomes],
-        )
-    if costs is not None:
-        _replace_costs(project, [CostInput(**item) for item in costs])
+        _apply_stakeholder_children(project, stakeholder_items, saved_stakeholders)
+        # 移除利害關係人也會刪掉他的成果與成本，所以只要送了利害關係人就重新整理
+        db.flush()
         _sync_actual_input_cost(db, project)
-    db.flush()
-    if outcomes is not None:
         _sync_outcomes_to_draft_forms(db, project)
+    db.flush()
 
     deleted_files = [
         record for record in project.interview_files

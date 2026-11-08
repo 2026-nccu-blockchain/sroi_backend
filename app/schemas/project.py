@@ -14,13 +14,31 @@ class ORMModel(BaseModel):
     model_config = ConfigDict(from_attributes=True, use_enum_values=True)
 
 
+class OutcomeInput(BaseModel):
+    outcome_id: Optional[str] = None
+    name: str = Field(min_length=1, max_length=255)
+
+
+class CostInput(BaseModel):
+    cost_id: Optional[str] = None
+    name: str = Field(min_length=1, max_length=255)
+    price: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
+    quantity: int = Field(default=1, ge=1)
+    funding_source: str = Field(default="", max_length=255)
+
+
 class StakeholderInput(BaseModel):
     stakeholder_id: Optional[str] = None
     name: str = Field(min_length=1, max_length=255)
-    role: str = Field(default="", max_length=100)
+    # 關係、類型：選「其他」時存自訂文字
+    relation: str = Field(default="", max_length=100)
+    stakeholder_type: str = Field(default="", max_length=100)
     notes: str = ""
     pre_form_id: Optional[str] = None
     post_form_id: Optional[str] = None
+    # 這位利害關係人的成果與成本；不帶就不動，帶空陣列會全部刪除
+    outcomes: Optional[list[OutcomeInput]] = None
+    costs: Optional[list[CostInput]] = None
 
     @model_validator(mode="after")
     def check_forms(self) -> "StakeholderInput":
@@ -39,27 +57,16 @@ class StakeholderUpdateInput(StakeholderInput):
     temp_file_ids: list[TempFileId] = Field(default_factory=list)
 
 
-class OutcomeInput(BaseModel):
-    outcome_id: Optional[str] = None
-    name: str = Field(min_length=1, max_length=255)
-
-
 class OutcomeRead(ORMModel):
     outcome_id: str
+    stakeholder_id: Optional[str]
     name: str
     position: int
 
 
-class CostInput(BaseModel):
-    cost_id: Optional[str] = None
-    name: str = Field(min_length=1, max_length=255)
-    price: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
-    quantity: int = Field(default=1, ge=1)
-    funding_source: str = Field(default="", max_length=255)
-
-
 class CostRead(ORMModel):
     cost_id: str
+    stakeholder_id: Optional[str]
     name: str
     price: Decimal
     quantity: int
@@ -100,7 +107,8 @@ class LinkedFormRead(ORMModel):
 class StakeholderRead(ORMModel):
     stakeholder_id: str
     name: str
-    role: str
+    relation: str
+    stakeholder_type: str
     notes: str
     position: int
     pre_form_id: Optional[str]
@@ -118,8 +126,8 @@ class ProjectCreate(BaseModel):
     begin: datetime
     end: datetime
     status: Literal["draft", "published"] = "draft"
+    # 成果與成本放在各利害關係人底下
     stakeholders: list[StakeholderInput] = Field(default_factory=list)
-    outcomes: list[OutcomeInput] = Field(default_factory=list)
 
     # 新增專案一定要有名稱
     @field_validator("name")
@@ -144,9 +152,8 @@ class ProjectUpdate(BaseModel):
     begin: Optional[datetime] = None
     end: Optional[datetime] = None
     status: Optional[Literal["draft", "published"]] = None
+    # 成果與成本放在各利害關係人底下
     stakeholders: Optional[list[StakeholderUpdateInput]] = None
-    outcomes: Optional[list[OutcomeInput]] = None
-    costs: Optional[list[CostInput]] = None
 
     # 明確送 null 仍交給 router 擋，只把空白名稱換成預設值
     @field_validator("name")
