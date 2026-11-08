@@ -263,6 +263,8 @@ class ProjectCost(Base):
 
     cost_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    # 所屬利害關係人；舊資料或專案沒有利害關係人時為 NULL
+    stakeholder_id = Column(String(36), ForeignKey("project_stakeholders.stakeholder_id", ondelete="CASCADE"), nullable=True, index=True)
     name = Column(String(255), nullable=False)  # 項目
     price = Column(Numeric(14, 2), nullable=False, default=0)  # 單價
     quantity = Column(Integer, nullable=False, default=1, server_default="1")  # 個數
@@ -273,6 +275,7 @@ class ProjectCost(Base):
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     project = relationship("Project", back_populates="costs")
+    stakeholder = relationship("ProjectStakeholder", back_populates="costs")
 
 
 class ProjectStakeholder(Base):
@@ -281,7 +284,12 @@ class ProjectStakeholder(Base):
     stakeholder_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(255), nullable=False)
+    # 已停用：舊的「關係／類型」文字，已搬到 stakeholder_type，API 不再使用
     role = Column(String(100), nullable=False, default="")
+    # 關係（影響力／參與度），選「其他」時存自訂文字
+    relation = Column(String(100), nullable=False, default="", server_default="")
+    # 類型（直接受益者等），選「其他」時存自訂文字
+    stakeholder_type = Column(String(100), nullable=False, default="", server_default="")
     notes = Column(Text, nullable=False, default="")
     pre_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 前測表單
     post_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 後測表單
@@ -307,6 +315,16 @@ class ProjectStakeholder(Base):
         order_by="ProjectInterviewFile.create_time",
     )
     outcome_valuations = relationship("ProjectOutcomeValuation", back_populates="stakeholder")
+    outcomes = relationship(
+        "ProjectOutcome",
+        back_populates="stakeholder",
+        order_by="ProjectOutcome.position",
+    )
+    costs = relationship(
+        "ProjectCost",
+        back_populates="stakeholder",
+        order_by="ProjectCost.position",
+    )
 
 
 class ProjectOutcome(Base):
@@ -314,6 +332,8 @@ class ProjectOutcome(Base):
 
     outcome_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    # 所屬利害關係人；舊資料或專案沒有利害關係人時為 NULL（視為所有利害關係人共用）
+    stakeholder_id = Column(String(36), ForeignKey("project_stakeholders.stakeholder_id", ondelete="CASCADE"), nullable=True, index=True)
     name = Column(String(255), nullable=False)
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
@@ -321,6 +341,7 @@ class ProjectOutcome(Base):
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     project = relationship("Project", back_populates="outcomes")
+    stakeholder = relationship("ProjectStakeholder", back_populates="outcomes")
     form_pages = relationship("Page", back_populates="project_outcome")
     valuations = relationship("ProjectOutcomeValuation", back_populates="outcome")
 
