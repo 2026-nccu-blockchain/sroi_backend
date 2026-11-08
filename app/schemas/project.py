@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -29,6 +29,16 @@ class StakeholderInput(BaseModel):
         return self
 
 
+TempFileId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+
+
+class StakeholderUpdateInput(StakeholderInput):
+    # 要保留的已儲存訪綱，沒列到的會刪除；不帶就不動
+    interview_file_ids: Optional[list[str]] = None
+    # 這次要正式存入的暫存訪綱
+    temp_file_ids: list[TempFileId] = Field(default_factory=list)
+
+
 class OutcomeInput(BaseModel):
     outcome_id: Optional[str] = None
     name: str = Field(min_length=1, max_length=255)
@@ -40,23 +50,20 @@ class OutcomeRead(ORMModel):
     position: int
 
 
-class CostCreate(BaseModel):
+class CostInput(BaseModel):
+    cost_id: Optional[str] = None
     name: str = Field(min_length=1, max_length=255)
     price: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
-    description: str = ""
-
-
-class CostUpdate(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
-    price: Optional[Decimal] = Field(default=None, ge=0, max_digits=14, decimal_places=2)
-    description: Optional[str] = None
+    quantity: int = Field(default=1, ge=1)
+    funding_source: str = Field(default="", max_length=255)
 
 
 class CostRead(ORMModel):
     cost_id: str
     name: str
     price: Decimal
-    description: str
+    quantity: int
+    funding_source: str
     position: int
     create_time: Optional[datetime]
     update_time: Optional[datetime]
@@ -75,6 +82,13 @@ class InterviewFileRead(ORMModel):
     content_type: str
     size_bytes: int
     create_time: Optional[datetime]
+
+
+class TempInterviewFileRead(BaseModel):
+    temp_file_id: str
+    original_name: str
+    content_type: str
+    size_bytes: int
 
 
 class LinkedFormRead(ORMModel):
@@ -98,7 +112,7 @@ class StakeholderRead(ORMModel):
 
 class ProjectCreate(BaseModel):
     group_id: Optional[str] = None  # 不帶就是個人專案
-    name: str = Field(default=DEFAULT_PROJECT_NAME, max_length=255)
+    name: str = Field(max_length=255)
     organization: str = Field(default="", max_length=255)
     description: str = ""
     begin: datetime
@@ -107,10 +121,14 @@ class ProjectCreate(BaseModel):
     stakeholders: list[StakeholderInput] = Field(default_factory=list)
     outcomes: list[OutcomeInput] = Field(default_factory=list)
 
+    # 新增專案一定要有名稱
     @field_validator("name")
     @classmethod
-    def default_name(cls, value: str) -> str:
-        return value.strip() or DEFAULT_PROJECT_NAME
+    def require_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("請輸入專案名稱")
+        return name
 
     @model_validator(mode="after")
     def check_period(self) -> "ProjectCreate":
@@ -126,8 +144,9 @@ class ProjectUpdate(BaseModel):
     begin: Optional[datetime] = None
     end: Optional[datetime] = None
     status: Optional[Literal["draft", "published"]] = None
-    stakeholders: Optional[list[StakeholderInput]] = None
+    stakeholders: Optional[list[StakeholderUpdateInput]] = None
     outcomes: Optional[list[OutcomeInput]] = None
+    costs: Optional[list[CostInput]] = None
 
     # 明確送 null 仍交給 router 擋，只把空白名稱換成預設值
     @field_validator("name")

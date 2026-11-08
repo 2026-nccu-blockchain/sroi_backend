@@ -129,11 +129,14 @@ class Group(Base):
     end = Column(DateTime(timezone=True), nullable=False)
     status = Column(SQLEnum(GroupStatus), nullable=False)
     reason = Column(Text, nullable=True)
+    # 建立（申請）群組的人；舊資料由遷移回填，查不到成員紀錄的舊群組會是空值
+    created_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=True, index=True)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     projects = relationship("Project", back_populates="group")
+    creator = relationship("Account", foreign_keys=[created_by])
 
 
 class GroupAccount(Base):
@@ -260,9 +263,10 @@ class ProjectCost(Base):
 
     cost_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
-    name = Column(String(255), nullable=False)
-    price = Column(Numeric(14, 2), nullable=False, default=0)
-    description = Column(Text, nullable=False, default="")
+    name = Column(String(255), nullable=False)  # 項目
+    price = Column(Numeric(14, 2), nullable=False, default=0)  # 單價
+    quantity = Column(Integer, nullable=False, default=1, server_default="1")  # 個數
+    funding_source = Column(String(255), nullable=False, default="", server_default="")  # 經費來源
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())

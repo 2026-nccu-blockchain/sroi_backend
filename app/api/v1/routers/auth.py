@@ -174,7 +174,7 @@ def change_email(request: Request, data: ChangeEmailRequest, db: Session = Depen
     user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
-    email = normalize_email_prefix(data.email_prefix)
+    email = data.email_prefix
     if db.query(Account).filter(Account.email == email, Account.is_delete == False).first() is not None:
         raise APIException(400, "10006", "register duplicate")
     user.email = email

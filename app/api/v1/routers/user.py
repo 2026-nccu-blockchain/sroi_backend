@@ -57,6 +57,7 @@ def add_group(request: Request, data: AddGroupRequest, db: Session = Depends(get
         begin=data.begin,
         end=data.end,
         status=GroupStatus.IN_PROGRESS,
+        created_by=user_id,
     )
     db.add(new_group)
     db.flush()

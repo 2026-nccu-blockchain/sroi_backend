@@ -1,16 +1,24 @@
 import io
+import shutil
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Literal, Optional
-from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
-from fastapi import APIRouter, Depends, File, Form as FormField, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload, with_loader_criteria
 from starlette.concurrency import run_in_threadpool
 
+from app.api.services.interview_files import (
+    INTERVIEW_UPLOAD_DIR,
+    discard_temp_interview_file,
+    load_temp_interview_file,
+    move_interview_file_to_deleted,
+    promote_temp_interview_file,
+    save_temp_interview_file,
+)
 from app.core.deps import return_payload
 from app.core.exceptions import APIException
 from app.core.permissions import (
@@ -39,9 +47,7 @@ from app.models.model import (
     ResponseStatus,
 )
 from app.schemas.project import (
-    CostCreate,
-    CostUpdate,
-    InterviewFileRead,
+    CostInput,
     OutcomeInput,
     ProjectCostsRead,
     ProjectCreate,
@@ -50,16 +56,15 @@ from app.schemas.project import (
     ProjectSROIUpdate,
     ProjectUpdate,
     StakeholderInput,
+    StakeholderUpdateInput,
+    TempInterviewFileRead,
 )
 
 
 router = APIRouter()
-INTERVIEW_UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "interview_guides"
-INTERVIEW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_INTERVIEW_FILE_SIZE = 10 * 1024 * 1024
 READ_CHUNK_SIZE = 1024 * 1024
 NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "begin", "end", "status"}
-NON_NULLABLE_COST_FIELDS = {"name", "price", "description"}
 MONEY_QUANTUM = Decimal("0.01")
 RATIO_QUANTUM = Decimal("0.0001")
 OUTCOME_ELIGIBILITY_THRESHOLD = Decimal("0.5")
@@ -348,28 +353,6 @@ def _as_aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def _owned_stakeholder(db: Session, project_id: str, stakeholder_id: str) -> ProjectStakeholder:
-    stakeholder = db.query(ProjectStakeholder).filter(
-        ProjectStakeholder.stakeholder_id == stakeholder_id,
-        ProjectStakeholder.project_id == project_id,
-        ProjectStakeholder.is_delete.is_(False),
-    ).first()
-    if stakeholder is None:
-        raise APIException(404, "30009", "利害關係人不存在")
-    return stakeholder
-
-
-def _owned_cost(db: Session, project_id: str, cost_id: str) -> ProjectCost:
-    cost = db.query(ProjectCost).filter(
-        ProjectCost.cost_id == cost_id,
-        ProjectCost.project_id == project_id,
-        ProjectCost.is_delete.is_(False),
-    ).first()
-    if cost is None:
-        raise APIException(404, "30010", "成本項目不存在")
-    return cost
-
-
 def _active_costs(db: Session, project_id: str) -> list[ProjectCost]:
     return db.query(ProjectCost).filter(
         ProjectCost.project_id == project_id,
@@ -378,9 +361,12 @@ def _active_costs(db: Session, project_id: str) -> list[ProjectCost]:
 
 
 def _sync_actual_input_cost(db: Session, project: Project) -> None:
-    """總成本由成本明細加總，存回 actual_input_cost 讓 SROI 計算沿用。"""
+    """總成本由成本明細（金額 × 個數）加總，存回 actual_input_cost 讓 SROI 計算沿用。"""
     db.flush()
-    total = sum((_decimal(cost.price) for cost in _active_costs(db, project.project_id)), Decimal("0"))
+    total = sum(
+        (_decimal(cost.price) * cost.quantity for cost in _active_costs(db, project.project_id)),
+        Decimal("0"),
+    )
     project.actual_input_cost = total.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
 
 
@@ -392,12 +378,14 @@ def _serialize_costs(db: Session, project: Project) -> dict:
     }
 
 
-def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> None:
+def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> list[ProjectStakeholder]:
+    """回傳與 items 同順序的利害關係人，讓後續步驟對應新建立的項目。"""
     existing = {
         stakeholder.stakeholder_id: stakeholder
         for stakeholder in project.stakeholders
         if not stakeholder.is_delete
     }
+    result: list[ProjectStakeholder] = []
     for position, item in enumerate(items):
         stakeholder = existing.pop(item.stakeholder_id, None) if item.stakeholder_id else None
         if stakeholder is None:
@@ -409,10 +397,67 @@ def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> No
         stakeholder.pre_form_id = item.pre_form_id
         stakeholder.post_form_id = item.post_form_id
         stakeholder.position = position
+        result.append(stakeholder)
     for stakeholder in existing.values():
         stakeholder.is_delete = True
         for record in stakeholder.interview_files:
             record.is_delete = True
+    return result
+
+
+def _replace_costs(project: Project, items: list[CostInput]) -> None:
+    existing = {cost.cost_id: cost for cost in project.costs if not cost.is_delete}
+    for position, item in enumerate(items):
+        cost = existing.pop(item.cost_id, None) if item.cost_id else None
+        if cost is None:
+            cost = ProjectCost()
+            project.costs.append(cost)
+        cost.name = item.name.strip()
+        cost.price = item.price
+        cost.quantity = item.quantity
+        cost.funding_source = item.funding_source.strip()
+        cost.position = position
+    for cost in existing.values():
+        cost.is_delete = True
+
+
+def _apply_interview_files(
+    db: Session,
+    project: Project,
+    items: list[StakeholderUpdateInput],
+    stakeholders: list[ProjectStakeholder],
+) -> list[dict]:
+    """刪除沒保留的訪綱、為暫存檔建立紀錄；回傳要搬到正式資料夾的暫存檔。"""
+    promotions: list[dict] = []
+    seen_temp_ids: set[str] = set()
+    for item, stakeholder in zip(items, stakeholders):
+        if item.interview_file_ids is not None:
+            keep = set(item.interview_file_ids)
+            active_ids = {record.file_id for record in stakeholder.interview_files if not record.is_delete}
+            if keep - active_ids:
+                raise APIException(400, "30006", "訪綱檔案不存在")
+            for record in stakeholder.interview_files:
+                if record.file_id not in keep:
+                    record.is_delete = True
+        for temp_file_id in item.temp_file_ids:
+            # 同一個暫存檔只能存一次，重複送就略過
+            if temp_file_id in seen_temp_ids:
+                continue
+            seen_temp_ids.add(temp_file_id)
+            meta = load_temp_interview_file(project.project_id, temp_file_id)
+            if meta is None:
+                raise APIException(400, "30011", "暫存的訪綱檔案已過期，請重新上傳")
+            stored_name = f"{project.project_id}_{temp_file_id}{meta['extension']}"
+            db.add(ProjectInterviewFile(
+                project=project,
+                stakeholder=stakeholder,
+                original_name=meta["original_name"],
+                stored_name=stored_name,
+                content_type=meta["content_type"],
+                size_bytes=meta["size_bytes"],
+            ))
+            promotions.append({**meta, "stored_name": stored_name})
+    return promotions
 
 
 def _replace_outcomes(project: Project, items: list[OutcomeInput]) -> None:
@@ -663,66 +708,6 @@ def list_project_costs(
     return _serialize_costs(db, project)
 
 
-@router.post("/{project_id}/costs", response_model=ProjectCostsRead, status_code=status.HTTP_201_CREATED)
-def create_project_cost(
-    project_id: str,
-    data: CostCreate,
-    db: Session = Depends(get_db),
-    payload: dict = Depends(return_payload),
-) -> dict:
-    project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
-    position = max((cost.position for cost in _active_costs(db, project_id)), default=-1) + 1
-    db.add(ProjectCost(
-        project_id=project_id,
-        name=data.name.strip(),
-        price=data.price,
-        description=data.description,
-        position=position,
-    ))
-    _sync_actual_input_cost(db, project)
-    db.commit()
-    return _serialize_costs(db, project)
-
-
-@router.patch("/{project_id}/costs/{cost_id}", response_model=ProjectCostsRead)
-def update_project_cost(
-    project_id: str,
-    cost_id: str,
-    data: CostUpdate,
-    db: Session = Depends(get_db),
-    payload: dict = Depends(return_payload),
-) -> dict:
-    project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
-    cost = _owned_cost(db, project_id, cost_id)
-    changes = data.model_dump(exclude_unset=True)
-    # exclude_unset 不會排除明確送 null 的欄位，NOT NULL 欄位要先擋掉
-    for field in NON_NULLABLE_COST_FIELDS & changes.keys():
-        if changes[field] is None:
-            raise APIException(400, "30008", f"{field} cannot be null")
-    if "name" in changes:
-        changes["name"] = changes["name"].strip()
-    for field, value in changes.items():
-        setattr(cost, field, value)
-    _sync_actual_input_cost(db, project)
-    db.commit()
-    return _serialize_costs(db, project)
-
-
-@router.delete("/{project_id}/costs/{cost_id}", response_model=ProjectCostsRead)
-def delete_project_cost(
-    project_id: str,
-    cost_id: str,
-    db: Session = Depends(get_db),
-    payload: dict = Depends(return_payload),
-) -> dict:
-    project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
-    cost = _owned_cost(db, project_id, cost_id)
-    cost.is_delete = True
-    _sync_actual_input_cost(db, project)
-    db.commit()
-    return _serialize_costs(db, project)
-
-
 @router.patch("/{project_id}", response_model=ProjectRead)
 def update_project(
     project_id: str,
@@ -730,11 +715,13 @@ def update_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Project:
+    """專案所有內容（含成本、訪綱）都在這裡一次儲存。"""
     user_id = _user_id(payload)
     project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
     changes = data.model_dump(exclude_unset=True)
     stakeholders = changes.pop("stakeholders", None)
     outcomes = changes.pop("outcomes", None)
+    costs = changes.pop("costs", None)
     # exclude_unset 不會排除明確送 null 的欄位，NOT NULL 欄位要先擋掉
     for field in NON_NULLABLE_PROJECT_FIELDS & changes.keys():
         if changes[field] is None:
@@ -743,19 +730,50 @@ def update_project(
         setattr(project, field, value)
     if _as_aware(project.end) < _as_aware(project.begin):
         raise APIException(400, "30008", "結束時間不可早於開始時間")
+    promotions: list[dict] = []
+    # 移除檔案或整個利害關係人都會讓訪綱變成刪除，記下原本有效的檔案來比對
+    active_file_ids = {record.file_id for record in project.interview_files if not record.is_delete}
     if stakeholders is not None:
-        stakeholder_items = [StakeholderInput(**item) for item in stakeholders]
+        stakeholder_items = [StakeholderUpdateInput(**item) for item in stakeholders]
         _validate_stakeholder_forms(db, stakeholder_items, project_id)
-        _replace_stakeholders(project, stakeholder_items)
+        saved_stakeholders = _replace_stakeholders(project, stakeholder_items)
+        promotions = _apply_interview_files(db, project, stakeholder_items, saved_stakeholders)
     if outcomes is not None:
         _replace_outcomes(
             project,
             [OutcomeInput(**item) for item in outcomes],
         )
+    if costs is not None:
+        _replace_costs(project, [CostInput(**item) for item in costs])
+        _sync_actual_input_cost(db, project)
     db.flush()
     if outcomes is not None:
         _sync_outcomes_to_draft_forms(db, project)
-    db.commit()
+
+    deleted_files = [
+        record for record in project.interview_files
+        if record.is_delete and record.file_id in active_file_ids
+    ]
+
+    # 檔案先處理再提交：暫存檔複製到正式資料夾、刪除的檔案移到刪除資料夾；失敗就全部還原
+    promoted: list[Path] = []
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for meta in promotions:
+            promoted.append(promote_temp_interview_file(meta, meta["stored_name"]))
+        for record in deleted_files:
+            if result := move_interview_file_to_deleted(record.stored_name):
+                moved.append(result)
+        db.commit()
+    except Exception:
+        db.rollback()
+        for target in promoted:
+            target.unlink(missing_ok=True)
+        for source, target in moved:
+            shutil.move(target, source)
+        raise
+    for meta in promotions:
+        discard_temp_interview_file(meta)
     return _get_project(db, project_id, user_id, GroupRole.VIEWER)
 
 
@@ -770,36 +788,33 @@ def delete_project(
     db.commit()
 
 
-@router.post("/{project_id}/interview-files", response_model=InterviewFileRead, status_code=status.HTTP_201_CREATED)
-async def upload_interview_file(
+@router.post(
+    "/{project_id}/interview-files/temp",
+    response_model=TempInterviewFileRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_temp_interview_file(
     project_id: str,
-    stakeholder_id: str = FormField(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
-) -> ProjectInterviewFile:
+) -> dict:
+    """先存到暫存資料夾，儲存專案時才寫入資料庫並搬到正式資料夾。"""
     project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
-    stakeholder = _owned_stakeholder(db, project_id, stakeholder_id)
     data = await _read_interview_file(file)
     detected = _detect_interview_type(data)
     if detected is None:
         raise APIException(400, "30004", "只接受 PDF、DOC 或 DOCX 訪綱檔案")
     extension, content_type = detected
     original_name = Path(file.filename or f"interview-guide{extension}").name[:255]
-    stored_name = f"{project.project_id}_{uuid4().hex}{extension}"
-    await run_in_threadpool((INTERVIEW_UPLOAD_DIR / stored_name).write_bytes, data)
-    record = ProjectInterviewFile(
-        project=project,
-        stakeholder=stakeholder,
-        original_name=original_name,
-        stored_name=stored_name,
-        content_type=content_type,
-        size_bytes=len(data),
+    return await run_in_threadpool(
+        save_temp_interview_file,
+        project.project_id,
+        data,
+        original_name,
+        extension,
+        content_type,
     )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return record
 
 
 @router.get("/{project_id}/interview-files/{file_id}")
@@ -821,22 +836,3 @@ def download_interview_file(
     if path.parent != INTERVIEW_UPLOAD_DIR.resolve() or not path.is_file():
         raise APIException(404, "30006", "訪綱檔案不存在")
     return FileResponse(path, media_type=record.content_type, filename=record.original_name)
-
-
-@router.delete("/{project_id}/interview-files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_interview_file(
-    project_id: str,
-    file_id: str,
-    db: Session = Depends(get_db),
-    payload: dict = Depends(return_payload),
-) -> None:
-    _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
-    record = db.query(ProjectInterviewFile).filter(
-        ProjectInterviewFile.file_id == file_id,
-        ProjectInterviewFile.project_id == project_id,
-        ProjectInterviewFile.is_delete.is_(False),
-    ).first()
-    if record is None:
-        raise APIException(404, "30006", "訪綱檔案不存在")
-    record.is_delete = True
-    db.commit()
