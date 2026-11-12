@@ -15,6 +15,7 @@ router = APIRouter()
 class ProxyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     value: Decimal
+    unit: str = Field(defalut="元",min_length=1, max_length=50) 
     note: str = ""
 
 
@@ -70,6 +71,7 @@ def create_proxy(
         created_by=str(payload["user_id"]),
         name=data.name,
         value=data.value,
+        unit=data.unit,
         note=data.note,
     )
     db.add(item)
@@ -88,6 +90,7 @@ def update_proxy(
     item = get_owned_proxy(db, proxy_id, str(payload["user_id"]))
     item.name = data.name
     item.value = data.value
+    item.unit = data.unit
     item.note = data.note
 
     db.commit()
