@@ -508,6 +508,7 @@ class FinancialProxy(Base):
 
     name = Column(String(255), nullable=False)
     value = Column(Numeric(18, 4), nullable=False)
+    unit = Column(String(50), nullable=False, default="元", server_default="元")
     note = Column(Text, nullable=False, default="")
 
     created_by = Column(
