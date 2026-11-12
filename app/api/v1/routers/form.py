@@ -283,6 +283,57 @@ def get_form(
     return _form_query(db).filter(Form.form_id == form_id).one()
 
 
+@router.post("/{form_id}/sync-project-outcomes", response_model=FormRead)
+def sync_project_outcomes(
+    form_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Form:
+    """只將這份表單同步進度之後新增的專案成果轉成區段。"""
+    form = _get_form(db, form_id, _user_id(payload), GroupRole.EDITOR)
+    if form.project_id is None:
+        raise APIException(400, "20035", "Form is not linked to a project")
+
+    pending_outcomes = db.query(ProjectOutcome).filter(
+        ProjectOutcome.project_id == form.project_id,
+        ProjectOutcome.sync_index > form.outcome_sync_index,
+    ).order_by(ProjectOutcome.sync_index).all()
+    if not pending_outcomes:
+        return _form_query(db).filter(Form.form_id == form_id).one()
+
+    # 舊表單在導入同步遊標前可能已經有成果區段，這些也不可重複新增。
+    linked_outcome_ids = {
+        outcome_id
+        for (outcome_id,) in db.query(Page.project_outcome_id).filter(
+            Page.form_id == form_id,
+            Page.project_outcome_id.is_not(None),
+        ).all()
+    }
+    active_pages = db.query(Page).filter(
+        Page.form_id == form_id,
+        Page.is_delete.is_(False),
+    ).all()
+    next_position = max((page.position for page in active_pages), default=-1) + 1
+
+    for outcome in pending_outcomes:
+        if outcome.is_delete or outcome.outcome_id in linked_outcome_ids:
+            continue
+        db.add(Page(
+            form=form,
+            project_outcome_id=outcome.outcome_id,
+            is_respondent_info=False,
+            title=outcome.name,
+            content="",
+            position=next_position,
+        ))
+        linked_outcome_ids.add(outcome.outcome_id)
+        next_position += 1
+
+    form.outcome_sync_index = pending_outcomes[-1].sync_index
+    db.commit()
+    return _form_query(db).filter(Form.form_id == form_id).one()
+
+
 @router.get("/public/{public_token}", response_model=PublicFormRead)
 def get_published_form(public_token: str, db: Session = Depends(get_db)) -> Form:
     form = _public_form_query(db).filter(
