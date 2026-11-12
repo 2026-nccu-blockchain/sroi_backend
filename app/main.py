@@ -1,3 +1,6 @@
+import asyncio
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from datetime import datetime, timedelta
 from fastapi.encoders import jsonable_encoder
@@ -9,16 +12,27 @@ from app.core.exceptions import APIException
 from app.schemas.common import ErrorResponse
 from app.core.middleware import CustomHeaderMiddleware, RateLimitMiddleware
 from app.api.v1.router import api_router
+from app.api.services.interview_files import run_interview_file_maintenance
 
 
 settings = get_settings()
 MAX_REQUESTS=settings.max_requests
 WINDOW_SECONDS=settings.window_seconds
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 定期清除沒有儲存的暫存訪綱、壓縮已刪除的訪綱
+    maintenance = asyncio.create_task(run_interview_file_maintenance())
+    yield
+    maintenance.cancel()
+
+
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     debug=settings.sroi_debug,
+    lifespan=lifespan,
 )
 
 app.add_middleware(CustomHeaderMiddleware)

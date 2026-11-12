@@ -11,13 +11,14 @@ import re
 
 
 class Role(Enum):
-    ADMIN = "admin"
-    DB_EDITOR = "db_editor"
+    ADMIN = "admin"           # 管理員
+    DB_EDITOR = "db_editor"   # 資料庫編輯者
+    NORMAL = "normal"         # 一般使用者
+
+class GroupStatus(Enum):
     VERIFIED = "verified"
     IN_PROGRESS = "in_progress"
     UNVERIFIED = "unverified"
-    LEADER = "leader"
-    MEMBER = "member"
 
 class GroupRole(Enum):
     LEADER = "leader"   # 組長：管理成員、刪除專案、編輯內容
@@ -41,6 +42,10 @@ class ResponseStatus(Enum):
     SUBMITTED = "submitted"
 
 
+# email 欄位只存 @ 前面的部分，寄信時才補上網域
+EMAIL_DOMAIN = "@nccu.edu.tw"
+
+
 class Account(Base):
     __tablename__ = "accounts"
 
@@ -50,7 +55,6 @@ class Account(Base):
     hash_password = Column(String(255), nullable=False)
     name = Column(String(20), nullable=False)
     role = Column(SQLEnum(Role), nullable=False)
-    id_card_link = Column(String(255))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
@@ -70,11 +74,18 @@ class Account(Base):
         return re.match(email_regex, email) is not None
 
     @staticmethod
+    def verify_email_prefix(prefix: str) -> bool:
+        return re.match(r'^[a-zA-Z0-9._%+-]+$', prefix) is not None
+
+    @property
+    def mail_address(self) -> str:
+        # 舊資料可能已經是完整 email，就不再補網域
+        return self.email if "@" in self.email else self.email + EMAIL_DOMAIN
+
+    @staticmethod
     def campus_id_taken(db, campus_id: str, exclude_user_id: Optional[str] = None) -> bool:
-        # 已審核通過（已驗證、資料庫編輯者、管理員）的帳號佔用中的學號
         query = db.query(Account).filter(
             Account.campus_id == campus_id,
-            Account.role.notin_([Role.UNVERIFIED, Role.IN_PROGRESS]),
             Account.is_delete == False,
         )
         if exclude_user_id is not None:
@@ -82,14 +93,27 @@ class Account(Base):
         return query.first() is not None
 
 
+class VerifiedCode(Base):
+    __tablename__ = "verified_codes"
+
+    uuid = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    email = Column(String(255), nullable=False, index=True)
+    code_hash = Column(String(64), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)  # 輸入錯誤的次數
+    is_verified = Column(Boolean, nullable=False, default=False)
+    is_delete = Column(Boolean, nullable=False, default=False)  # 重寄、過期、錯太多次時作廢
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+
 class VerifiedInProgress(Base):
     __tablename__ = "verified_in_progress"
 
+    # 學號變更申請
     uuid  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    is_ver = Column(Boolean, nullable=False) # 是認證還是更改
     campus_id = Column(String(36), nullable=False) # 教職員編號、學號
     user_id = Column(String(36), nullable=False)
-    id_card_link = Column(String(255), nullable=False)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
@@ -103,13 +127,16 @@ class Group(Base):
     desc = Column(Text, nullable=False)
     begin = Column(DateTime(timezone=True), nullable=False)
     end = Column(DateTime(timezone=True), nullable=False)
-    status = Column(SQLEnum(Role), nullable=False)
+    status = Column(SQLEnum(GroupStatus), nullable=False)
     reason = Column(Text, nullable=True)
+    # 建立（申請）群組的人；舊資料由遷移回填，查不到成員紀錄的舊群組會是空值
+    created_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=True, index=True)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     projects = relationship("Project", back_populates="group")
+    creator = relationship("Account", foreign_keys=[created_by])
 
 
 class GroupAccount(Base):
@@ -144,6 +171,8 @@ class Form(Base):
     title = Column(String(255))
     content = Column(Text)
     status = Column(SQLEnum(FormStatus), nullable=False, default=FormStatus.DRAFT)
+    shuffle_outcome_questions = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    outcome_sync_index = Column(Integer, nullable=False, default=0, server_default="0")
     result_id_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -189,6 +218,7 @@ class Project(Base):
     begin = Column(DateTime(timezone=True), nullable=False)
     end = Column(DateTime(timezone=True), nullable=False)
     sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
+    outcome_sync_sequence = Column(Integer, nullable=False, default=0, server_default="0")
     status = Column(String(20), nullable=False, default="draft")
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -202,6 +232,11 @@ class Project(Base):
         back_populates="project",
         foreign_keys="Form.project_id",
         order_by="Form.create_time.desc()",
+    )
+    costs = relationship(
+        "ProjectCost",
+        back_populates="project",
+        order_by="ProjectCost.position",
     )
     stakeholders = relationship(
         "ProjectStakeholder",
@@ -225,16 +260,42 @@ class Project(Base):
         return self.group_id is None
 
 
+class ProjectCost(Base):
+    __tablename__ = "project_costs"
+
+    cost_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    # 所屬利害關係人；舊資料或專案沒有利害關係人時為 NULL
+    stakeholder_id = Column(String(36), ForeignKey("project_stakeholders.stakeholder_id", ondelete="CASCADE"), nullable=True, index=True)
+    name = Column(String(255), nullable=False)  # 項目
+    price = Column(Numeric(14, 2), nullable=False, default=0)  # 單價
+    quantity = Column(Integer, nullable=False, default=1, server_default="1")  # 個數
+    funding_source = Column(String(255), nullable=False, default="", server_default="")  # 經費來源
+    position = Column(Integer, nullable=False, default=0)
+    is_delete = Column(Boolean, nullable=False, default=False)
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    project = relationship("Project", back_populates="costs")
+    stakeholder = relationship("ProjectStakeholder", back_populates="costs")
+
+
 class ProjectStakeholder(Base):
     __tablename__ = "project_stakeholders"
 
     stakeholder_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(255), nullable=False)
+    # 已停用：舊的「關係／類型」文字，已搬到 stakeholder_type，API 不再使用
     role = Column(String(100), nullable=False, default="")
+    # 關係（影響力／參與度），選「其他」時存自訂文字
+    relation = Column(String(100), nullable=False, default="", server_default="")
+    # 類型（直接受益者等），選「其他」時存自訂文字
+    stakeholder_type = Column(String(100), nullable=False, default="", server_default="")
     notes = Column(Text, nullable=False, default="")
     pre_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 前測表單
     post_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 後測表單
+    sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -256,6 +317,17 @@ class ProjectStakeholder(Base):
         back_populates="stakeholder",
         order_by="ProjectInterviewFile.create_time",
     )
+    outcome_valuations = relationship("ProjectOutcomeValuation", back_populates="stakeholder")
+    outcomes = relationship(
+        "ProjectOutcome",
+        back_populates="stakeholder",
+        order_by="ProjectOutcome.position",
+    )
+    costs = relationship(
+        "ProjectCost",
+        back_populates="stakeholder",
+        order_by="ProjectCost.position",
+    )
 
 
 class ProjectOutcome(Base):
@@ -263,24 +335,41 @@ class ProjectOutcome(Base):
 
     outcome_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    # 所屬利害關係人；舊資料或專案沒有利害關係人時為 NULL（視為所有利害關係人共用）
+    stakeholder_id = Column(String(36), ForeignKey("project_stakeholders.stakeholder_id", ondelete="CASCADE"), nullable=True, index=True)
     name = Column(String(255), nullable=False)
+    sync_index = Column(Integer, nullable=False, default=0, server_default="0")
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     project = relationship("Project", back_populates="outcomes")
+    stakeholder = relationship("ProjectStakeholder", back_populates="outcomes")
     form_pages = relationship("Page", back_populates="project_outcome")
-    valuation = relationship("ProjectOutcomeValuation", back_populates="outcome", uselist=False)
+    valuations = relationship("ProjectOutcomeValuation", back_populates="outcome")
 
 
 class ProjectOutcomeValuation(Base):
     __tablename__ = "project_outcome_valuations"
-    __table_args__ = (UniqueConstraint("outcome_id", name="uq_project_outcome_valuation_outcome"),)
+    __table_args__ = (
+        UniqueConstraint(
+            "stakeholder_id",
+            "outcome_id",
+            name="uq_project_outcome_valuation_stakeholder_outcome",
+        ),
+    )
 
     valuation_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
+    stakeholder_id = Column(String(36), ForeignKey("project_stakeholders.stakeholder_id", ondelete="CASCADE"), nullable=True, index=True)
     outcome_id = Column(String(36), ForeignKey("project_outcomes.outcome_id", ondelete="CASCADE"), nullable=False, index=True)
+    financial_proxy_id = Column(
+        String(36),
+        ForeignKey("financial_proxies.proxy_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     quantity = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
     financial_proxy_value = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
     deadweight_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
@@ -294,7 +383,9 @@ class ProjectOutcomeValuation(Base):
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
     project = relationship("Project", back_populates="outcome_valuations")
-    outcome = relationship("ProjectOutcome", back_populates="valuation")
+    stakeholder = relationship("ProjectStakeholder", back_populates="outcome_valuations")
+    outcome = relationship("ProjectOutcome", back_populates="valuations")
+    financial_proxy = relationship("FinancialProxy", back_populates="outcome_valuations")
 
 
 class ProjectInterviewFile(Base):
@@ -486,6 +577,7 @@ class FinancialProxy(Base):
 
     name = Column(String(255), nullable=False)
     value = Column(Numeric(18, 4), nullable=False)
+    unit = Column(String(50), nullable=False, default="元", server_default="元")
     note = Column(Text, nullable=False, default="")
 
     created_by = Column(
@@ -499,4 +591,8 @@ class FinancialProxy(Base):
     create_time = Column(
         DateTime(timezone=True),
         server_default=func.now(),
+    )
+    outcome_valuations = relationship(
+        "ProjectOutcomeValuation",
+        back_populates="financial_proxy",
     )

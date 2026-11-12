@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     admin_email: str | None = None
     admin_password: str | None = None
     admin_name: str = "管理員"
+    brevo_api_key: str = ""
+    brevo_sender_email: str = ""
+    brevo_sender_name: str = "SROI"
+    brevo_welcome_template_id: int = 0
 
     class Config:
         env_file = ".env"
@@ -43,5 +47,4 @@ def get_settings() -> Settings:
     Returns:
         Settings: The singleton settings object.
     """
-
     return Settings()

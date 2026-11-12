@@ -1,16 +1,24 @@
 import io
+import shutil
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Literal, Optional
-from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
-from fastapi import APIRouter, Depends, File, Form as FormField, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session, selectinload, with_loader_criteria
 from starlette.concurrency import run_in_threadpool
 
+from app.api.services.interview_files import (
+    INTERVIEW_UPLOAD_DIR,
+    discard_temp_interview_file,
+    load_temp_interview_file,
+    move_interview_file_to_deleted,
+    promote_temp_interview_file,
+    save_temp_interview_file,
+)
 from app.core.deps import return_payload
 from app.core.exceptions import APIException
 from app.core.permissions import (
@@ -25,10 +33,11 @@ from app.models.model import (
     Answer,
     Form,
     FormResponse,
-    FormStatus,
+    FinancialProxy,
     GroupRole,
     Page,
     Project,
+    ProjectCost,
     ProjectInterviewFile,
     ProjectOutcome,
     ProjectOutcomeValuation,
@@ -38,23 +47,24 @@ from app.models.model import (
     ResponseStatus,
 )
 from app.schemas.project import (
-    InterviewFileRead,
+    CostInput,
     OutcomeInput,
+    ProjectCostsRead,
     ProjectCreate,
     ProjectRead,
-    ProjectSROIRead,
-    ProjectSROIUpdate,
+    StakeholderSROIRead,
+    StakeholderSROIUpdate,
     ProjectUpdate,
     StakeholderInput,
+    StakeholderUpdateInput,
+    TempInterviewFileRead,
 )
 
 
 router = APIRouter()
-INTERVIEW_UPLOAD_DIR = Path(__file__).resolve().parents[3] / "uploads" / "interview_guides"
-INTERVIEW_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_INTERVIEW_FILE_SIZE = 10 * 1024 * 1024
 READ_CHUNK_SIZE = 1024 * 1024
-NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "actual_input_cost", "begin", "end", "status"}
+NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "begin", "end", "status"}
 MONEY_QUANTUM = Decimal("0.01")
 RATIO_QUANTUM = Decimal("0.0001")
 OUTCOME_ELIGIBILITY_THRESHOLD = Decimal("0.5")
@@ -73,11 +83,13 @@ def _project_query(db: Session):
         selectinload(Project.stakeholders).selectinload(ProjectStakeholder.post_form),
         selectinload(Project.stakeholders).selectinload(ProjectStakeholder.interview_files),
         selectinload(Project.outcomes),
+        selectinload(Project.costs),
         selectinload(Project.interview_files),
         selectinload(Project.forms),
         with_loader_criteria(Form, Form.is_delete.is_(False)),
         with_loader_criteria(ProjectStakeholder, ProjectStakeholder.is_delete.is_(False)),
         with_loader_criteria(ProjectOutcome, ProjectOutcome.is_delete.is_(False)),
+        with_loader_criteria(ProjectCost, ProjectCost.is_delete.is_(False)),
         with_loader_criteria(ProjectInterviewFile, ProjectInterviewFile.is_delete.is_(False)),
     )
 
@@ -130,10 +142,11 @@ def _outcome_scale_metrics(
     db: Session,
     project_id: str,
     outcome_ids: set[str],
+    form_ids: set[str] | None = None,
 ) -> dict[str, tuple[float, int]]:
     if not outcome_ids:
         return {}
-    rows = db.query(
+    query = db.query(
         Page.project_outcome_id,
         Answer.number_value,
         Question.scale_begin,
@@ -163,7 +176,12 @@ def _outcome_scale_metrics(
         FormResponse.status == ResponseStatus.SUBMITTED,
         FormResponse.is_duplicate_legacy.is_(False),
         FormResponse.is_delete.is_(False),
-    ).all()
+    )
+    if form_ids is not None:
+        if not form_ids:
+            return {}
+        query = query.filter(Form.form_id.in_(form_ids))
+    rows = query.all()
 
     scores: dict[str, list[Decimal]] = {outcome_id: [] for outcome_id in outcome_ids}
     for outcome_id, number_value, scale_begin, scale_end in rows:
@@ -179,30 +197,99 @@ def _outcome_scale_metrics(
     }
 
 
-def _serialize_project_sroi(db: Session, project: Project) -> dict:
-    outcomes = sorted(
-        (outcome for outcome in project.outcomes if not outcome.is_delete),
-        key=lambda outcome: outcome.position,
+def _active_stakeholders(project: Project) -> list[ProjectStakeholder]:
+    return sorted(
+        (stakeholder for stakeholder in project.stakeholders if not stakeholder.is_delete),
+        key=lambda stakeholder: stakeholder.position,
     )
-    outcome_ids = {outcome.outcome_id for outcome in outcomes}
+
+
+def _ordered_outcomes(project: Project) -> list[ProjectOutcome]:
+    """依「利害關係人順序 → 成果順序」排列；沒有指定利害關係人的舊成果排最前面。"""
+    stakeholder_positions = {
+        stakeholder.stakeholder_id: stakeholder.position
+        for stakeholder in _active_stakeholders(project)
+    }
+    return sorted(
+        (
+            outcome for outcome in project.outcomes
+            if not outcome.is_delete
+            and (outcome.stakeholder_id is None or outcome.stakeholder_id in stakeholder_positions)
+        ),
+        key=lambda outcome: (
+            -1 if outcome.stakeholder_id is None else stakeholder_positions[outcome.stakeholder_id],
+            outcome.position,
+        ),
+    )
+
+
+def _outcomes_of(outcomes: list[ProjectOutcome], stakeholder_id: str) -> list[ProjectOutcome]:
+    """利害關係人自己的成果，加上沒有指定利害關係人的舊成果（視為共用）。"""
+    return [
+        outcome for outcome in outcomes
+        if outcome.stakeholder_id is None or outcome.stakeholder_id == stakeholder_id
+    ]
+
+
+def _get_active_stakeholder(project: Project, stakeholder_id: str) -> ProjectStakeholder:
+    stakeholder = next(
+        (
+            item for item in project.stakeholders
+            if item.stakeholder_id == stakeholder_id and not item.is_delete
+        ),
+        None,
+    )
+    if stakeholder is None:
+        raise APIException(404, "30012", "利害關係人不屬於此專案")
+    return stakeholder
+
+
+def _serialize_stakeholder_sroi(
+    db: Session,
+    project: Project,
+    stakeholder: ProjectStakeholder,
+) -> dict:
+    outcomes = _ordered_outcomes(project)
+    stakeholder_outcomes = _outcomes_of(outcomes, stakeholder.stakeholder_id)
+    outcome_ids = {outcome.outcome_id for outcome in stakeholder_outcomes}
     valuations = {
         valuation.outcome_id: valuation
         for valuation in db.query(ProjectOutcomeValuation).filter(
             ProjectOutcomeValuation.project_id == project.project_id,
+            ProjectOutcomeValuation.stakeholder_id == stakeholder.stakeholder_id,
             ProjectOutcomeValuation.outcome_id.in_(outcome_ids) if outcome_ids else False,
             ProjectOutcomeValuation.is_delete.is_(False),
         ).all()
     }
-    scale_metrics = _outcome_scale_metrics(db, project.project_id, outcome_ids)
-    discount_rate = _decimal(project.sroi_discount_rate, "0.035")
+    input_cost = sum(
+        (
+            _decimal(cost.price) * cost.quantity
+            for cost in project.costs
+            if not cost.is_delete and cost.stakeholder_id == stakeholder.stakeholder_id
+        ),
+        Decimal("0"),
+    ).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+    discount_rate = _decimal(stakeholder.sroi_discount_rate, "0.035")
+    linked_form_ids = {
+        form_id for form_id in (stakeholder.pre_form_id, stakeholder.post_form_id) if form_id
+    }
+    scale_metrics = _outcome_scale_metrics(
+        db,
+        project.project_id,
+        outcome_ids,
+        linked_form_ids,
+    )
     serialized_outcomes: list[dict] = []
     total_social_value = Decimal("0")
     has_missing_proxy = False
 
-    for outcome in outcomes:
+    for outcome in stakeholder_outcomes:
         valuation = valuations.get(outcome.outcome_id)
+        proxy = valuation.financial_proxy if valuation else None
+        if proxy is not None and proxy.is_delete:
+            proxy = None
         quantity = _decimal(valuation.quantity if valuation else None)
-        financial_proxy_value = _decimal(valuation.financial_proxy_value if valuation else None)
+        financial_proxy_value = _decimal(proxy.value if proxy else None)
         deadweight_rate = _decimal(valuation.deadweight_rate if valuation else None)
         attribution_rate = _decimal(valuation.attribution_rate if valuation else None)
         displacement_rate = _decimal(valuation.displacement_rate if valuation else None)
@@ -221,7 +308,7 @@ def _serialize_project_sroi(db: Session, project: Project) -> dict:
             is_included=is_included,
         )
         total_social_value += calculated_value
-        if is_included and financial_proxy_value <= 0:
+        if is_included and proxy is None:
             has_missing_proxy = True
         metric = scale_metrics.get(outcome.outcome_id)
         scale_score = metric[0] if metric else None
@@ -231,6 +318,9 @@ def _serialize_project_sroi(db: Session, project: Project) -> dict:
             "outcome_name": outcome.name,
             "position": outcome.position,
             "quantity": quantity,
+            "financial_proxy_id": proxy.proxy_id if proxy else None,
+            "financial_proxy_name": proxy.name if proxy else None,
+            "financial_proxy_note": proxy.note if proxy else None,
             "financial_proxy_value": financial_proxy_value,
             "deadweight_rate": deadweight_rate,
             "attribution_rate": attribution_rate,
@@ -244,15 +334,21 @@ def _serialize_project_sroi(db: Session, project: Project) -> dict:
             "calculated_value": calculated_value,
         })
 
-    actual_input_cost = _decimal(project.actual_input_cost)
     total_social_value = total_social_value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
     sroi_ratio = None
-    if actual_input_cost > 0 and not has_missing_proxy:
-        sroi_ratio = (total_social_value / actual_input_cost).quantize(RATIO_QUANTUM, rounding=ROUND_HALF_UP)
+    if input_cost > 0 and not has_missing_proxy:
+        sroi_ratio = (total_social_value / input_cost).quantize(
+            RATIO_QUANTUM,
+            rounding=ROUND_HALF_UP,
+        )
     return {
         "project_id": project.project_id,
         "project_name": project.name,
-        "actual_input_cost": actual_input_cost,
+        "stakeholder_id": stakeholder.stakeholder_id,
+        "stakeholder_name": stakeholder.name,
+        "stakeholder_role": stakeholder.stakeholder_type,
+        "position": stakeholder.position,
+        "input_cost": input_cost,
         "discount_rate": discount_rate,
         "outcomes": serialized_outcomes,
         "total_social_value": total_social_value,
@@ -293,103 +389,164 @@ def _as_aware(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
-def _owned_stakeholder(db: Session, project_id: str, stakeholder_id: str) -> ProjectStakeholder:
-    stakeholder = db.query(ProjectStakeholder).filter(
-        ProjectStakeholder.stakeholder_id == stakeholder_id,
-        ProjectStakeholder.project_id == project_id,
-        ProjectStakeholder.is_delete.is_(False),
-    ).first()
-    if stakeholder is None:
-        raise APIException(404, "30009", "利害關係人不存在")
-    return stakeholder
+def _active_costs(db: Session, project_id: str) -> list[ProjectCost]:
+    return db.query(ProjectCost).filter(
+        ProjectCost.project_id == project_id,
+        ProjectCost.is_delete.is_(False),
+    ).order_by(ProjectCost.position, ProjectCost.create_time).all()
 
 
-def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> None:
+def _sync_actual_input_cost(db: Session, project: Project) -> None:
+    """總成本由成本明細（金額 × 個數）加總，存回 actual_input_cost 讓 SROI 計算沿用。"""
+    db.flush()
+    total = sum(
+        (_decimal(cost.price) * cost.quantity for cost in _active_costs(db, project.project_id)),
+        Decimal("0"),
+    )
+    project.actual_input_cost = total.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def _serialize_costs(db: Session, project: Project) -> dict:
+    return {
+        "project_id": project.project_id,
+        "costs": _active_costs(db, project.project_id),
+        "total_cost": _decimal(project.actual_input_cost),
+    }
+
+
+def _replace_stakeholders(project: Project, items: list[StakeholderInput]) -> list[ProjectStakeholder]:
+    """回傳與 items 同順序的利害關係人，讓後續步驟對應新建立的項目。
+    被移除的利害關係人，他的訪綱、成果、成本一起標記刪除。"""
     existing = {
         stakeholder.stakeholder_id: stakeholder
         for stakeholder in project.stakeholders
         if not stakeholder.is_delete
     }
+    result: list[ProjectStakeholder] = []
     for position, item in enumerate(items):
         stakeholder = existing.pop(item.stakeholder_id, None) if item.stakeholder_id else None
         if stakeholder is None:
             stakeholder = ProjectStakeholder()
             project.stakeholders.append(stakeholder)
         stakeholder.name = item.name
-        stakeholder.role = item.role
+        stakeholder.relation = item.relation.strip()
+        stakeholder.stakeholder_type = item.stakeholder_type.strip()
         stakeholder.notes = item.notes
         stakeholder.pre_form_id = item.pre_form_id
         stakeholder.post_form_id = item.post_form_id
         stakeholder.position = position
+        result.append(stakeholder)
     for stakeholder in existing.values():
         stakeholder.is_delete = True
         for record in stakeholder.interview_files:
             record.is_delete = True
+        for outcome in stakeholder.outcomes:
+            outcome.is_delete = True
+        for cost in stakeholder.costs:
+            cost.is_delete = True
+    return result
 
 
-def _replace_outcomes(project: Project, items: list[OutcomeInput]) -> None:
+def _apply_stakeholder_children(
+    project: Project,
+    items: list[StakeholderInput],
+    stakeholders: list[ProjectStakeholder],
+) -> tuple[bool, bool]:
+    """依各利害關係人底下的 outcomes / costs 取代他的成果與成本；回傳（成果有沒有送、成本有沒有送）。"""
+    outcomes_sent = costs_sent = False
+    for item, stakeholder in zip(items, stakeholders):
+        if item.outcomes is not None:
+            outcomes_sent = True
+            _replace_outcomes(project, stakeholder, item.outcomes)
+        if item.costs is not None:
+            costs_sent = True
+            _replace_costs(project, stakeholder, item.costs)
+    return outcomes_sent, costs_sent
+
+
+def _replace_costs(project: Project, stakeholder: ProjectStakeholder, items: list[CostInput]) -> None:
+    # 只動這位利害關係人的成本；沒有指定利害關係人的舊成本也可以被認領
+    existing = {
+        cost.cost_id: cost
+        for cost in project.costs
+        if not cost.is_delete and (cost.stakeholder is stakeholder or (cost.stakeholder is None and cost.stakeholder_id is None))
+    }
+    owned = {cost_id for cost_id, cost in existing.items() if cost.stakeholder is stakeholder}
+    for position, item in enumerate(items):
+        cost = existing.pop(item.cost_id, None) if item.cost_id else None
+        if cost is None:
+            cost = ProjectCost()
+            project.costs.append(cost)
+        cost.stakeholder = stakeholder
+        cost.name = item.name.strip()
+        cost.price = item.price
+        cost.quantity = item.quantity
+        cost.funding_source = item.funding_source.strip()
+        cost.position = position
+    for cost_id, cost in existing.items():
+        if cost_id in owned:
+            cost.is_delete = True
+
+
+def _apply_interview_files(
+    db: Session,
+    project: Project,
+    items: list[StakeholderUpdateInput],
+    stakeholders: list[ProjectStakeholder],
+) -> list[dict]:
+    """刪除沒保留的訪綱、為暫存檔建立紀錄；回傳要搬到正式資料夾的暫存檔。"""
+    promotions: list[dict] = []
+    seen_temp_ids: set[str] = set()
+    for item, stakeholder in zip(items, stakeholders):
+        if item.interview_file_ids is not None:
+            keep = set(item.interview_file_ids)
+            active_ids = {record.file_id for record in stakeholder.interview_files if not record.is_delete}
+            if keep - active_ids:
+                raise APIException(400, "30006", "訪綱檔案不存在")
+            for record in stakeholder.interview_files:
+                if record.file_id not in keep:
+                    record.is_delete = True
+        for temp_file_id in item.temp_file_ids:
+            # 同一個暫存檔只能存一次，重複送就略過
+            if temp_file_id in seen_temp_ids:
+                continue
+            seen_temp_ids.add(temp_file_id)
+            meta = load_temp_interview_file(project.project_id, temp_file_id)
+            if meta is None:
+                raise APIException(400, "30011", "暫存的訪綱檔案已過期，請重新上傳")
+            stored_name = f"{project.project_id}_{temp_file_id}{meta['extension']}"
+            db.add(ProjectInterviewFile(
+                project=project,
+                stakeholder=stakeholder,
+                original_name=meta["original_name"],
+                stored_name=stored_name,
+                content_type=meta["content_type"],
+                size_bytes=meta["size_bytes"],
+            ))
+            promotions.append({**meta, "stored_name": stored_name})
+    return promotions
+
+
+def _replace_outcomes(project: Project, stakeholder: ProjectStakeholder, items: list[OutcomeInput]) -> None:
+    # 只動這位利害關係人的成果；沒有指定利害關係人的舊成果也可以被認領
     existing = {
         outcome.outcome_id: outcome
         for outcome in project.outcomes
-        if not outcome.is_delete
+        if not outcome.is_delete and (outcome.stakeholder is stakeholder or (outcome.stakeholder is None and outcome.stakeholder_id is None))
     }
+    owned = {outcome_id for outcome_id, outcome in existing.items() if outcome.stakeholder is stakeholder}
     for position, item in enumerate(items):
         outcome = existing.pop(item.outcome_id, None) if item.outcome_id else None
         if outcome is None:
-            outcome = ProjectOutcome()
+            project.outcome_sync_sequence = (project.outcome_sync_sequence or 0) + 1
+            outcome = ProjectOutcome(sync_index=project.outcome_sync_sequence)
             project.outcomes.append(outcome)
+        outcome.stakeholder = stakeholder
         outcome.name = item.name.strip()
         outcome.position = position
-    for outcome in existing.values():
-        outcome.is_delete = True
-
-
-def _sync_outcomes_to_draft_forms(db: Session, project: Project) -> None:
-    """Keep editable forms aligned while treating published forms as snapshots."""
-    draft_forms = db.query(Form).filter(
-        Form.project_id == project.project_id,
-        Form.status == FormStatus.DRAFT,
-        Form.is_delete.is_(False),
-    ).all()
-
-    for form in draft_forms:
-        pages = db.query(Page).filter(
-            Page.form_id == form.form_id,
-            Page.is_delete.is_(False),
-        ).order_by(Page.position).all()
-        pages_by_outcome = {
-            page.project_outcome_id: page
-            for page in pages
-            if page.project_outcome_id is not None
-        }
-
-        active_outcomes = sorted(
-            (outcome for outcome in project.outcomes if not outcome.is_delete),
-            key=lambda outcome: outcome.position,
-        )
-        ordered_outcome_pages: list[Page] = []
-        for outcome in active_outcomes:
-            page = pages_by_outcome.get(outcome.outcome_id)
-            if page is None:
-                page = Page(
-                    form_id=form.form_id,
-                    project_outcome_id=outcome.outcome_id,
-                    title=outcome.name,
-                    content="",
-                )
-                db.add(page)
-                pages.append(page)
-            else:
-                page.title = outcome.name
-            ordered_outcome_pages.append(page)
-
-        respondent_pages = [page for page in pages if page.is_respondent_info]
-        custom_pages = [
-            page for page in pages
-            if page not in respondent_pages and page not in ordered_outcome_pages
-        ]
-        for position, page in enumerate([*respondent_pages, *ordered_outcome_pages, *custom_pages]):
-            page.position = position
+    for outcome_id, outcome in existing.items():
+        if outcome_id in owned:
+            outcome.is_delete = True
 
 
 async def _read_interview_file(upload: UploadFile) -> bytes:
@@ -462,15 +619,16 @@ def create_project(
         name=data.name,
         organization=data.organization,
         description=data.description,
-        actual_input_cost=data.actual_input_cost,
         begin=data.begin,
         end=data.end,
         status=data.status,
     )
-    _replace_stakeholders(project, data.stakeholders)
-    _replace_outcomes(project, data.outcomes)
+    saved_stakeholders = _replace_stakeholders(project, data.stakeholders)
+    _, costs_sent = _apply_stakeholder_children(project, data.stakeholders, saved_stakeholders)
     db.add(project)
     db.flush()
+    if costs_sent:
+        _sync_actual_input_cost(db, project)
     db.commit()
     return _get_project(db, project.project_id, user_id, GroupRole.VIEWER)
 
@@ -484,53 +642,82 @@ def get_project(
     return _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
 
 
-@router.get("/{project_id}/sroi", response_model=ProjectSROIRead)
-def get_project_sroi(
+@router.get(
+    "/{project_id}/stakeholders/{stakeholder_id}/sroi",
+    response_model=StakeholderSROIRead,
+)
+def get_stakeholder_sroi(
     project_id: str,
+    stakeholder_id: str,
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> dict:
     project = _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
-    return _serialize_project_sroi(db, project)
+    stakeholder = _get_active_stakeholder(project, stakeholder_id)
+    return _serialize_stakeholder_sroi(db, project, stakeholder)
 
 
-@router.put("/{project_id}/sroi", response_model=ProjectSROIRead)
-def save_project_sroi(
+@router.put(
+    "/{project_id}/stakeholders/{stakeholder_id}/sroi",
+    response_model=StakeholderSROIRead,
+)
+def save_stakeholder_sroi(
     project_id: str,
-    data: ProjectSROIUpdate,
+    stakeholder_id: str,
+    data: StakeholderSROIUpdate,
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> dict:
     user_id = _user_id(payload)
     project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
-    active_outcome_ids = {
-        outcome.outcome_id
-        for outcome in project.outcomes
-        if not outcome.is_delete
+    stakeholder = _get_active_stakeholder(project, stakeholder_id)
+    outcomes = _ordered_outcomes(project)
+    allowed_ids = {
+        outcome.outcome_id for outcome in _outcomes_of(outcomes, stakeholder_id)
     }
-    submitted_outcome_ids = {item.outcome_id for item in data.outcomes}
-    if not submitted_outcome_ids.issubset(active_outcome_ids):
-        raise APIException(400, "30009", "SROI 成果不屬於此專案")
+    if not {item.outcome_id for item in data.outcomes}.issubset(allowed_ids):
+        raise APIException(400, "30009", "SROI 成果不屬於此利害關係人")
 
-    project.actual_input_cost = data.actual_input_cost
-    project.sroi_discount_rate = data.discount_rate
-    existing = {
+    proxy_ids = {
+        item.financial_proxy_id
+        for item in data.outcomes
+        if item.financial_proxy_id is not None
+    }
+    proxies = {
+        proxy.proxy_id: proxy
+        for proxy in db.query(FinancialProxy).filter(
+            FinancialProxy.proxy_id.in_(proxy_ids) if proxy_ids else False,
+            FinancialProxy.is_delete.is_(False),
+        ).all()
+    }
+    if set(proxies) != proxy_ids:
+        raise APIException(400, "30013", "財務代理變數不存在或已刪除")
+
+    stakeholder.sroi_discount_rate = data.discount_rate
+
+    existing_valuations = {
         valuation.outcome_id: valuation
         for valuation in db.query(ProjectOutcomeValuation).filter(
             ProjectOutcomeValuation.project_id == project_id,
-            ProjectOutcomeValuation.outcome_id.in_(submitted_outcome_ids) if submitted_outcome_ids else False,
+            ProjectOutcomeValuation.stakeholder_id == stakeholder_id,
         ).all()
     }
+    retained_valuation_ids: set[str] = set()
     for item in data.outcomes:
-        valuation = existing.get(item.outcome_id)
+        valuation = existing_valuations.get(item.outcome_id)
         if valuation is None:
             valuation = ProjectOutcomeValuation(
                 project_id=project_id,
+                stakeholder_id=stakeholder_id,
                 outcome_id=item.outcome_id,
             )
             db.add(valuation)
+            db.flush()
+        proxy = proxies.get(item.financial_proxy_id)
         valuation.quantity = item.quantity
-        valuation.financial_proxy_value = item.financial_proxy_value
+        valuation.financial_proxy_id = item.financial_proxy_id
+        # 保留一份儲存當下的金額快照；讀取計算時以代理變數資料庫的現值為準。
+        valuation.financial_proxy_value = proxy.value if proxy else Decimal("0")
         valuation.deadweight_rate = item.deadweight_rate
         valuation.attribution_rate = item.attribution_rate
         valuation.displacement_rate = item.displacement_rate
@@ -538,10 +725,25 @@ def save_project_sroi(
         valuation.dropoff_rate = item.dropoff_rate
         valuation.is_included = item.is_included
         valuation.is_delete = False
+        retained_valuation_ids.add(valuation.valuation_id)
+    for valuation in existing_valuations.values():
+        if valuation.valuation_id not in retained_valuation_ids:
+            valuation.is_delete = True
 
     db.commit()
     project = _get_project(db, project_id, user_id, GroupRole.VIEWER)
-    return _serialize_project_sroi(db, project)
+    stakeholder = _get_active_stakeholder(project, stakeholder_id)
+    return _serialize_stakeholder_sroi(db, project, stakeholder)
+
+
+@router.get("/{project_id}/costs", response_model=ProjectCostsRead)
+def list_project_costs(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> dict:
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
+    return _serialize_costs(db, project)
 
 
 @router.patch("/{project_id}", response_model=ProjectRead)
@@ -551,11 +753,11 @@ def update_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> Project:
+    """專案所有內容（含成本、訪綱）都在這裡一次儲存。"""
     user_id = _user_id(payload)
     project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
     changes = data.model_dump(exclude_unset=True)
     stakeholders = changes.pop("stakeholders", None)
-    outcomes = changes.pop("outcomes", None)
     # exclude_unset 不會排除明確送 null 的欄位，NOT NULL 欄位要先擋掉
     for field in NON_NULLABLE_PROJECT_FIELDS & changes.keys():
         if changes[field] is None:
@@ -564,19 +766,44 @@ def update_project(
         setattr(project, field, value)
     if _as_aware(project.end) < _as_aware(project.begin):
         raise APIException(400, "30008", "結束時間不可早於開始時間")
+    promotions: list[dict] = []
+    # 移除檔案或整個利害關係人都會讓訪綱變成刪除，記下原本有效的檔案來比對
+    active_file_ids = {record.file_id for record in project.interview_files if not record.is_delete}
     if stakeholders is not None:
-        stakeholder_items = [StakeholderInput(**item) for item in stakeholders]
+        stakeholder_items = [StakeholderUpdateInput(**item) for item in stakeholders]
         _validate_stakeholder_forms(db, stakeholder_items, project_id)
-        _replace_stakeholders(project, stakeholder_items)
-    if outcomes is not None:
-        _replace_outcomes(
-            project,
-            [OutcomeInput(**item) for item in outcomes],
-        )
+        saved_stakeholders = _replace_stakeholders(project, stakeholder_items)
+        promotions = _apply_interview_files(db, project, stakeholder_items, saved_stakeholders)
+        _apply_stakeholder_children(project, stakeholder_items, saved_stakeholders)
+        # 移除利害關係人也會刪掉他的成果與成本，所以只要送了利害關係人就重新整理
+        db.flush()
+        _sync_actual_input_cost(db, project)
     db.flush()
-    if outcomes is not None:
-        _sync_outcomes_to_draft_forms(db, project)
-    db.commit()
+
+    deleted_files = [
+        record for record in project.interview_files
+        if record.is_delete and record.file_id in active_file_ids
+    ]
+
+    # 檔案先處理再提交：暫存檔複製到正式資料夾、刪除的檔案移到刪除資料夾；失敗就全部還原
+    promoted: list[Path] = []
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for meta in promotions:
+            promoted.append(promote_temp_interview_file(meta, meta["stored_name"]))
+        for record in deleted_files:
+            if result := move_interview_file_to_deleted(record.stored_name):
+                moved.append(result)
+        db.commit()
+    except Exception:
+        db.rollback()
+        for target in promoted:
+            target.unlink(missing_ok=True)
+        for source, target in moved:
+            shutil.move(target, source)
+        raise
+    for meta in promotions:
+        discard_temp_interview_file(meta)
     return _get_project(db, project_id, user_id, GroupRole.VIEWER)
 
 
@@ -591,36 +818,33 @@ def delete_project(
     db.commit()
 
 
-@router.post("/{project_id}/interview-files", response_model=InterviewFileRead, status_code=status.HTTP_201_CREATED)
-async def upload_interview_file(
+@router.post(
+    "/{project_id}/interview-files/temp",
+    response_model=TempInterviewFileRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_temp_interview_file(
     project_id: str,
-    stakeholder_id: str = FormField(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
-) -> ProjectInterviewFile:
+) -> dict:
+    """先存到暫存資料夾，儲存專案時才寫入資料庫並搬到正式資料夾。"""
     project = _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
-    stakeholder = _owned_stakeholder(db, project_id, stakeholder_id)
     data = await _read_interview_file(file)
     detected = _detect_interview_type(data)
     if detected is None:
         raise APIException(400, "30004", "只接受 PDF、DOC 或 DOCX 訪綱檔案")
     extension, content_type = detected
     original_name = Path(file.filename or f"interview-guide{extension}").name[:255]
-    stored_name = f"{project.project_id}_{uuid4().hex}{extension}"
-    await run_in_threadpool((INTERVIEW_UPLOAD_DIR / stored_name).write_bytes, data)
-    record = ProjectInterviewFile(
-        project=project,
-        stakeholder=stakeholder,
-        original_name=original_name,
-        stored_name=stored_name,
-        content_type=content_type,
-        size_bytes=len(data),
+    return await run_in_threadpool(
+        save_temp_interview_file,
+        project.project_id,
+        data,
+        original_name,
+        extension,
+        content_type,
     )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return record
 
 
 @router.get("/{project_id}/interview-files/{file_id}")
@@ -642,22 +866,3 @@ def download_interview_file(
     if path.parent != INTERVIEW_UPLOAD_DIR.resolve() or not path.is_file():
         raise APIException(404, "30006", "訪綱檔案不存在")
     return FileResponse(path, media_type=record.content_type, filename=record.original_name)
-
-
-@router.delete("/{project_id}/interview-files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_interview_file(
-    project_id: str,
-    file_id: str,
-    db: Session = Depends(get_db),
-    payload: dict = Depends(return_payload),
-) -> None:
-    _get_project(db, project_id, _user_id(payload), GroupRole.EDITOR)
-    record = db.query(ProjectInterviewFile).filter(
-        ProjectInterviewFile.file_id == file_id,
-        ProjectInterviewFile.project_id == project_id,
-        ProjectInterviewFile.is_delete.is_(False),
-    ).first()
-    if record is None:
-        raise APIException(404, "30006", "訪綱檔案不存在")
-    record.is_delete = True
-    db.commit()

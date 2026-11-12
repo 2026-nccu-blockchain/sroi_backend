@@ -2,7 +2,7 @@ from fastapi import APIRouter, Request, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from app.db.session import get_db
-from app.models.model import Role, GroupRole, Account, VerifiedInProgress, Group, GroupAccount
+from app.models.model import Role, GroupRole, GroupStatus, Account, Group, GroupAccount
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
@@ -30,15 +30,13 @@ def invite_group(request: Request, GroupId: str, data: InviteRequest, db: Sessio
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    user = db.query(Account).filter(Account.user_id == user_id, Account.role != Role.UNVERIFIED, 
-                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:    
         raise APIException(400, "10008", "permission denied")
-    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == GroupStatus.VERIFIED, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
-    invited_user = db.query(Account).filter(Account.user_id == data.user_id, Account.role != Role.UNVERIFIED, 
-                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    invited_user = db.query(Account).filter(Account.user_id == data.user_id, Account.is_delete == False).first()
     if invited_user is None:
         raise APIException(404, "10001", "user not found")
     group_leader = db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == user_id, 
@@ -68,15 +66,13 @@ def change_permission(request: Request, GroupId: str, data: ChangeRoleRequest, d
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    user = db.query(Account).filter(Account.user_id == user_id, Account.role != Role.UNVERIFIED, 
-                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:    
         raise APIException(400, "10008", "permission denied")
-    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == GroupStatus.VERIFIED, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
-    change_user = db.query(Account).filter(Account.user_id == data.user_id, Account.role != Role.UNVERIFIED, 
-                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    change_user = db.query(Account).filter(Account.user_id == data.user_id, Account.is_delete == False).first()
     if change_user is None:
         raise APIException(404, "10001", "user not found")
     group_leader = db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == user_id, 
@@ -108,11 +104,10 @@ def delete_member(request: Request, GroupId: str, UserId: str, db: Session = Dep
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    user = db.query(Account).filter(Account.user_id == user_id, Account.role != Role.UNVERIFIED, 
-                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:    
         raise APIException(400, "10008", "permission denied")
-    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == GroupStatus.VERIFIED, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
     delete_member = db.query(GroupAccount).filter(GroupAccount.user_id == UserId, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
@@ -139,14 +134,13 @@ def get_group_info(request: Request, GroupId: str, db: Session = Depends(get_db)
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    user = db.query(Account).filter(Account.user_id == user_id, Account.role != Role.UNVERIFIED, 
-                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:    
         raise APIException(400, "10008", "permission denied")
     group = db.query(Group).filter(Group.group_id == GroupId, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
-    if group.status == Role.VERIFIED:
+    if group.status == GroupStatus.VERIFIED:
         member = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
         if member is None:
             raise APIException(400, "10008", "permission denied")
@@ -177,11 +171,10 @@ def get_group_role(request: Request, GroupId: str, db: Session = Depends(get_db)
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    user = db.query(Account).filter(Account.user_id == user_id, Account.role != Role.UNVERIFIED, 
-                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:    
         raise APIException(400, "10008", "permission denied")
-    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == GroupStatus.VERIFIED, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
     member = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
@@ -201,11 +194,10 @@ def group_search_user(request: Request, GroupId: str, Search: str, db: Session =
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    user = db.query(Account).filter(Account.user_id == user_id, Account.role != Role.UNVERIFIED, 
-                                    Account.role != Role.IN_PROGRESS, Account.is_delete == False).first()
+    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
     if user is None:    
         raise APIException(400, "10008", "permission denied")
-    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == GroupStatus.VERIFIED, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
     group_leader = db.query(GroupAccount).filter(GroupAccount.user_id == user_id, GroupAccount.group_id == GroupId, 
@@ -213,7 +205,7 @@ def group_search_user(request: Request, GroupId: str, Search: str, db: Session =
     if group_leader is None and user.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     users = db.query(Account).filter(or_(Account.campus_id.ilike(f"%{Search}%"), Account.name.ilike(f"%{Search}%")), 
-                                     Account.role != Role.UNVERIFIED, Account.role != Role.IN_PROGRESS, Account.is_delete == False).all()
+                                     Account.is_delete == False).all()
 
     return APIResponse(
         status_code="00000",
@@ -235,7 +227,7 @@ def update_group(request: Request, data: GroupUpdateRequest, GroupId: str, db: S
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == Role.VERIFIED, Group.is_delete == False).first()
+    group = db.query(Group).filter(Group.group_id == GroupId, Group.status == GroupStatus.VERIFIED, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
     if check_group_member_role(db, user_id, GroupId) != GroupRole.LEADER:
@@ -263,7 +255,7 @@ def delete_group(request: Request, GroupId: str, db: Session = Depends(get_db)) 
     verify_token(request)
     payload = return_payload(request)
     user_id = payload["user_id"]
-    group = db.query(Group).filter(Group.group_id == GroupId, or_(Group.status == Role.VERIFIED, Group.status == Role.UNVERIFIED), 
+    group = db.query(Group).filter(Group.group_id == GroupId, or_(Group.status == GroupStatus.VERIFIED, Group.status == GroupStatus.UNVERIFIED), 
                                    Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")

@@ -11,13 +11,15 @@ def seed_admin() -> None:
 
     db = SessionLocal()
     try:
-        exists = db.query(Account).filter(Account.email == settings.admin_email).first()
+        # DB 只存前綴；舊資料可能存的是完整 email，兩種都算已存在
+        prefix = settings.admin_email.split("@")[0].strip().lower()
+        exists = db.query(Account).filter(Account.email.in_([settings.admin_email, prefix])).first()
         if exists:
             print(f"[seed] 管理員 {settings.admin_email} 已存在")
             return
 
         admin = Account(
-            email=settings.admin_email,
+            email=prefix,
             name=settings.admin_name,
             role=Role.ADMIN,
         )
