@@ -60,6 +60,20 @@ def list_proxies(
     )
 
 
+@router.get("/options", response_model=list[ProxyRead])
+def list_proxy_options(
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+):
+    """供 SROI 選擇使用的共用資料庫；編輯與刪除仍只限建立者。"""
+    return (
+        db.query(FinancialProxy)
+        .filter(FinancialProxy.is_delete.is_(False))
+        .order_by(FinancialProxy.name, FinancialProxy.create_time.desc())
+        .all()
+    )
+
+
 
 @router.post("", response_model=ProxyRead, status_code=status.HTTP_201_CREATED)
 def create_proxy(

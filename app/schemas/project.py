@@ -187,7 +187,7 @@ class ProjectRead(ORMModel):
 class OutcomeValuationInput(BaseModel):
     outcome_id: str
     quantity: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
-    financial_proxy_value: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
+    financial_proxy_id: Optional[str] = None
     deadweight_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
     attribution_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
     displacement_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
@@ -196,28 +196,15 @@ class OutcomeValuationInput(BaseModel):
     is_included: bool = True
 
 
-class StakeholderValuationInput(BaseModel):
-    stakeholder_id: str
+class StakeholderSROIUpdate(BaseModel):
+    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
     outcomes: list[OutcomeValuationInput] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def check_unique_outcomes(self) -> "StakeholderValuationInput":
+    def check_unique_outcomes(self) -> "StakeholderSROIUpdate":
         outcome_ids = [item.outcome_id for item in self.outcomes]
         if len(outcome_ids) != len(set(outcome_ids)):
             raise ValueError("同一位利害關係人的成果不可重複")
-        return self
-
-
-class ProjectSROIUpdate(BaseModel):
-    actual_input_cost: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
-    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
-    stakeholders: list[StakeholderValuationInput] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def check_unique_items(self) -> "ProjectSROIUpdate":
-        stakeholder_ids = [item.stakeholder_id for item in self.stakeholders]
-        if len(stakeholder_ids) != len(set(stakeholder_ids)):
-            raise ValueError("利害關係人不可重複")
         return self
 
 
@@ -226,6 +213,9 @@ class OutcomeValuationRead(BaseModel):
     outcome_name: str
     position: int
     quantity: Decimal
+    financial_proxy_id: Optional[str]
+    financial_proxy_name: Optional[str]
+    financial_proxy_note: Optional[str]
     financial_proxy_value: Decimal
     deadweight_rate: Decimal
     attribution_rate: Decimal
@@ -240,20 +230,14 @@ class OutcomeValuationRead(BaseModel):
 
 
 class StakeholderSROIRead(BaseModel):
+    project_id: str
+    project_name: str
     stakeholder_id: str
     stakeholder_name: str
     stakeholder_role: str
     position: int
-    outcomes: list[OutcomeValuationRead]
-    total_social_value: Decimal
-    sroi_ratio: Optional[Decimal]
-
-
-class ProjectSROIRead(BaseModel):
-    project_id: str
-    project_name: str
-    actual_input_cost: Decimal
+    input_cost: Decimal
     discount_rate: Decimal
-    stakeholders: list[StakeholderSROIRead]
+    outcomes: list[OutcomeValuationRead]
     total_social_value: Decimal
     sroi_ratio: Optional[Decimal]
