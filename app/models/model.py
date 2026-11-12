@@ -172,6 +172,7 @@ class Form(Base):
     content = Column(Text)
     status = Column(SQLEnum(FormStatus), nullable=False, default=FormStatus.DRAFT)
     shuffle_outcome_questions = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    outcome_sync_index = Column(Integer, nullable=False, default=0, server_default="0")
     result_id_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -217,6 +218,7 @@ class Project(Base):
     begin = Column(DateTime(timezone=True), nullable=False)
     end = Column(DateTime(timezone=True), nullable=False)
     sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
+    outcome_sync_sequence = Column(Integer, nullable=False, default=0, server_default="0")
     status = Column(String(20), nullable=False, default="draft")
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -336,6 +338,7 @@ class ProjectOutcome(Base):
     # 所屬利害關係人；舊資料或專案沒有利害關係人時為 NULL（視為所有利害關係人共用）
     stakeholder_id = Column(String(36), ForeignKey("project_stakeholders.stakeholder_id", ondelete="CASCADE"), nullable=True, index=True)
     name = Column(String(255), nullable=False)
+    sync_index = Column(Integer, nullable=False, default=0, server_default="0")
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())

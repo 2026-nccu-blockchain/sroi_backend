@@ -156,6 +156,7 @@ class FormRead(ORMModel):
     content: Optional[str]
     status: FormStatus
     shuffle_outcome_questions: bool
+    outcome_sync_index: int
     create_time: Optional[datetime]
     update_time: Optional[datetime]
     pages: list[PageRead] = Field(default_factory=list)

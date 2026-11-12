@@ -33,7 +33,6 @@ from app.models.model import (
     Answer,
     Form,
     FormResponse,
-    FormStatus,
     FinancialProxy,
     GroupRole,
     Page,
@@ -539,7 +538,8 @@ def _replace_outcomes(project: Project, stakeholder: ProjectStakeholder, items: 
     for position, item in enumerate(items):
         outcome = existing.pop(item.outcome_id, None) if item.outcome_id else None
         if outcome is None:
-            outcome = ProjectOutcome()
+            project.outcome_sync_sequence = (project.outcome_sync_sequence or 0) + 1
+            outcome = ProjectOutcome(sync_index=project.outcome_sync_sequence)
             project.outcomes.append(outcome)
         outcome.stakeholder = stakeholder
         outcome.name = item.name.strip()
@@ -547,51 +547,6 @@ def _replace_outcomes(project: Project, stakeholder: ProjectStakeholder, items: 
     for outcome_id, outcome in existing.items():
         if outcome_id in owned:
             outcome.is_delete = True
-
-
-def _sync_outcomes_to_draft_forms(db: Session, project: Project) -> None:
-    """Keep editable forms aligned while treating published forms as snapshots."""
-    draft_forms = db.query(Form).filter(
-        Form.project_id == project.project_id,
-        Form.status == FormStatus.DRAFT,
-        Form.is_delete.is_(False),
-    ).all()
-
-    for form in draft_forms:
-        pages = db.query(Page).filter(
-            Page.form_id == form.form_id,
-            Page.is_delete.is_(False),
-        ).order_by(Page.position).all()
-        pages_by_outcome = {
-            page.project_outcome_id: page
-            for page in pages
-            if page.project_outcome_id is not None
-        }
-
-        active_outcomes = _ordered_outcomes(project)
-        ordered_outcome_pages: list[Page] = []
-        for outcome in active_outcomes:
-            page = pages_by_outcome.get(outcome.outcome_id)
-            if page is None:
-                page = Page(
-                    form_id=form.form_id,
-                    project_outcome_id=outcome.outcome_id,
-                    title=outcome.name,
-                    content="",
-                )
-                db.add(page)
-                pages.append(page)
-            else:
-                page.title = outcome.name
-            ordered_outcome_pages.append(page)
-
-        respondent_pages = [page for page in pages if page.is_respondent_info]
-        custom_pages = [
-            page for page in pages
-            if page not in respondent_pages and page not in ordered_outcome_pages
-        ]
-        for position, page in enumerate([*respondent_pages, *ordered_outcome_pages, *custom_pages]):
-            page.position = position
 
 
 async def _read_interview_file(upload: UploadFile) -> bytes:
@@ -823,7 +778,6 @@ def update_project(
         # 移除利害關係人也會刪掉他的成果與成本，所以只要送了利害關係人就重新整理
         db.flush()
         _sync_actual_input_cost(db, project)
-        _sync_outcomes_to_draft_forms(db, project)
     db.flush()
 
     deleted_files = [
