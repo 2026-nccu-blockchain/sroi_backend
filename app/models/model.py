@@ -293,6 +293,7 @@ class ProjectStakeholder(Base):
     notes = Column(Text, nullable=False, default="")
     pre_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 前測表單
     post_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 後測表單
+    sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -360,6 +361,12 @@ class ProjectOutcomeValuation(Base):
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=False, index=True)
     stakeholder_id = Column(String(36), ForeignKey("project_stakeholders.stakeholder_id", ondelete="CASCADE"), nullable=True, index=True)
     outcome_id = Column(String(36), ForeignKey("project_outcomes.outcome_id", ondelete="CASCADE"), nullable=False, index=True)
+    financial_proxy_id = Column(
+        String(36),
+        ForeignKey("financial_proxies.proxy_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     quantity = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
     financial_proxy_value = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
     deadweight_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
@@ -375,6 +382,7 @@ class ProjectOutcomeValuation(Base):
     project = relationship("Project", back_populates="outcome_valuations")
     stakeholder = relationship("ProjectStakeholder", back_populates="outcome_valuations")
     outcome = relationship("ProjectOutcome", back_populates="valuations")
+    financial_proxy = relationship("FinancialProxy", back_populates="outcome_valuations")
 
 
 class ProjectInterviewFile(Base):
@@ -579,4 +587,8 @@ class FinancialProxy(Base):
     create_time = Column(
         DateTime(timezone=True),
         server_default=func.now(),
+    )
+    outcome_valuations = relationship(
+        "ProjectOutcomeValuation",
+        back_populates="financial_proxy",
     )
