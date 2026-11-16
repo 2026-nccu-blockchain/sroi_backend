@@ -175,6 +175,8 @@ class ProjectRead(ORMModel):
     begin: datetime
     end: datetime
     status: str
+    closed_at: Optional[datetime] = None
+    published_at: Optional[datetime] = None
     forms: list[LinkedFormRead] = Field(default_factory=list)
     stakeholders: list[StakeholderRead] = Field(default_factory=list)
     outcomes: list[OutcomeRead] = Field(default_factory=list)

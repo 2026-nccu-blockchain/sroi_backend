@@ -94,12 +94,18 @@ def _project_query(db: Session):
     )
 
 
-def _get_project(db: Session, project_id: str, user_id: str, min_role: GroupRole) -> Project:
+def _get_project(
+    db: Session,
+    project_id: str,
+    user_id: str,
+    min_role: GroupRole,
+    allow_closed: bool = False,
+) -> Project:
     project = _project_query(db).filter(
         Project.project_id == project_id,
         Project.is_delete.is_(False),
     ).first()
-    role = require_project_role(db, project, user_id, min_role)
+    role = require_project_role(db, project, user_id, min_role, allow_closed=allow_closed)
     project.my_role = role.value
     return project
 
@@ -813,9 +819,45 @@ def delete_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> None:
-    project = _get_project(db, project_id, _user_id(payload), GroupRole.LEADER)
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.LEADER, allow_closed=True)
     project.is_delete = True
     db.commit()
+
+
+@router.post("/{project_id}/close", response_model=ProjectRead)
+def close_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """結案：只有組長能做，且專案期間結束後（待結案）才能結案；結案後無法復原。"""
+    user_id = _user_id(payload)
+    project = _get_project(db, project_id, user_id, GroupRole.LEADER, allow_closed=True)
+    if project.closed_at is not None:
+        raise APIException(409, "30014", "專案已結案")
+    if datetime.now(timezone.utc) <= _as_aware(project.end):
+        raise APIException(400, "30015", "專案期間尚未結束，還不能結案")
+    project.closed_at = datetime.now(timezone.utc)
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
+
+
+@router.post("/{project_id}/publish", response_model=ProjectRead)
+def publish_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """發布至資料庫：只有組長能做，且必須先結案；發布只能一次。"""
+    user_id = _user_id(payload)
+    project = _get_project(db, project_id, user_id, GroupRole.LEADER, allow_closed=True)
+    if project.closed_at is None:
+        raise APIException(400, "30016", "專案結案後才能發布至資料庫")
+    if project.published_at is not None:
+        raise APIException(409, "30017", "專案已發布至資料庫")
+    project.published_at = datetime.now(timezone.utc)
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
 
 
 @router.post(
