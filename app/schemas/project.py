@@ -168,6 +168,10 @@ class ProjectRead(ORMModel):
     group_id: Optional[str]
     created_by: str
     my_role: Optional[GroupRole] = None
+    # 是否為專案成員；從共用資料庫檢視別人的已發布專案時是 False
+    is_member: bool = True
+    # 作者姓名；目前只有共用資料庫的列表會帶
+    creator_name: Optional[str] = None
     name: str
     organization: str
     description: str

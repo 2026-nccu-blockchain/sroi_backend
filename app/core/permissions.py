@@ -59,11 +59,20 @@ def get_user_group_roles(db: Session, user_id: str) -> dict[str, GroupRole]:
     return {m.group_id: m.group_role for m in _active_membership_query(db, user_id).all()}
 
 
-def get_project_role(db: Session, project: Project, user_id: str) -> GroupRole | None:
+def get_member_project_role(db: Session, project: Project, user_id: str) -> GroupRole | None:
+    """使用者在專案裡真正的角色；不是成員就是 None"""
     # 個人專案的擁有者視同組長
     if project.is_personal:
         return GroupRole.LEADER if project.owner_id == user_id else None
     return get_group_role(db, project.group_id, user_id)
+
+
+def get_project_role(db: Session, project: Project, user_id: str) -> GroupRole | None:
+    role = get_member_project_role(db, project, user_id)
+    # 已發布至資料庫的專案公開給所有登入使用者檢視（含專案表單）；已發布一定已結案，所以不會被拿來修改
+    if role is None and project.published_at is not None:
+        return GroupRole.VIEWER
+    return role
 
 
 def ensure_project_open(project: Project | None) -> None:

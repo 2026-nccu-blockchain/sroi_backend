@@ -24,6 +24,7 @@ from app.core.exceptions import APIException
 from app.core.permissions import (
     accessible_project_filter,
     get_group_role,
+    get_member_project_role,
     get_user_group_roles,
     has_role,
     require_project_role,
@@ -107,6 +108,8 @@ def _get_project(
     ).first()
     role = require_project_role(db, project, user_id, min_role, allow_closed=allow_closed)
     project.my_role = role.value
+    # 從共用資料庫打開別人的已發布專案時是 False，前端據此決定返回哪裡
+    project.is_member = get_member_project_role(db, project, user_id) is not None
     return project
 
 
@@ -604,6 +607,33 @@ def list_projects(
     for project in projects:
         role = GroupRole.LEADER if project.is_personal else group_roles[project.group_id]
         project.my_role = role.value
+    return projects
+
+
+# 要放在 /{project_id} 之前，不然 "published" 會被當成專案 id
+@router.get("/published", response_model=list[ProjectRead])
+def list_published_projects(
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> list[Project]:
+    """共用資料庫：所有登入使用者都看得到已發布至資料庫的專案。"""
+    user_id = _user_id(payload)
+    projects = _project_query(db).options(selectinload(Project.creator)).filter(
+        Project.published_at.isnot(None),
+        Project.is_delete.is_(False),
+    ).order_by(Project.published_at.desc()).all()
+
+    # 不是成員的人也能以檢視者身分打開，跟 get_project_role 的規則一致
+    group_roles = get_user_group_roles(db, user_id)
+    for project in projects:
+        if project.is_personal:
+            role = GroupRole.LEADER if project.owner_id == user_id else None
+        else:
+            role = group_roles.get(project.group_id)
+        project.is_member = role is not None
+        project.my_role = (role or GroupRole.VIEWER).value
+        # 作者：建立專案的人
+        project.creator_name = project.creator.name if project.creator else None
     return projects
 
 
