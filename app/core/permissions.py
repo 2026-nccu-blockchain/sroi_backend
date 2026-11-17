@@ -2,7 +2,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.core.exceptions import APIException
-from app.models.model import Account, Form, Group, GroupAccount, GroupRole, GroupStatus, Project
+from app.models.model import Account, Form, Group, GroupAccount, GroupRole, GroupStatus, Project, Role
 
 
 ROLE_LEVEL = {GroupRole.VIEWER: 1, GroupRole.EDITOR: 2, GroupRole.LEADER: 3}
@@ -67,12 +67,31 @@ def get_member_project_role(db: Session, project: Project, user_id: str) -> Grou
     return get_group_role(db, project.group_id, user_id)
 
 
+def can_review_projects(db: Session, user_id: str) -> bool:
+    """資料庫編輯者與管理員能審核專案"""
+    return db.query(Account).filter(
+        Account.user_id == user_id,
+        Account.role.in_([Role.DB_EDITOR, Role.ADMIN]),
+        Account.is_delete.is_(False),
+    ).first() is not None
+
+
+def is_project_reviewing(project: Project) -> bool:
+    """已結案、已送審、還沒發布"""
+    return project.closed_at is not None and project.review_requested_at is not None and project.published_at is None
+
+
 def get_project_role(db: Session, project: Project, user_id: str) -> GroupRole | None:
     role = get_member_project_role(db, project, user_id)
+    if role is not None:
+        return role
     # 已發布至資料庫的專案公開給所有登入使用者檢視（含專案表單）；已發布一定已結案，所以不會被拿來修改
-    if role is None and project.published_at is not None:
+    if project.published_at is not None:
         return GroupRole.VIEWER
-    return role
+    # 審核中的專案讓資料庫編輯者、管理員以檢視者身分查看；審核中一定已結案
+    if is_project_reviewing(project) and can_review_projects(db, user_id):
+        return GroupRole.VIEWER
+    return None
 
 
 def ensure_project_open(project: Project | None) -> None:

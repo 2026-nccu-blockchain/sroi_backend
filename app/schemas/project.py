@@ -180,6 +180,8 @@ class ProjectRead(ORMModel):
     end: datetime
     status: str
     closed_at: Optional[datetime] = None
+    # 送審時間；有值且還沒 published_at 表示審核中
+    review_requested_at: Optional[datetime] = None
     published_at: Optional[datetime] = None
     forms: list[LinkedFormRead] = Field(default_factory=list)
     stakeholders: list[StakeholderRead] = Field(default_factory=list)
@@ -247,3 +249,7 @@ class StakeholderSROIRead(BaseModel):
     outcomes: list[OutcomeValuationRead]
     total_social_value: Decimal
     sroi_ratio: Optional[Decimal]
+
+
+class ProjectReviewDecision(BaseModel):
+    approved: bool
