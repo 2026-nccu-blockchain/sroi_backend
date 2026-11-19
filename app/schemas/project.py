@@ -168,6 +168,10 @@ class ProjectRead(ORMModel):
     group_id: Optional[str]
     created_by: str
     my_role: Optional[GroupRole] = None
+    # 是否為專案成員；從共用資料庫檢視別人的已發布專案時是 False
+    is_member: bool = True
+    # 作者姓名；目前只有共用資料庫的列表會帶
+    creator_name: Optional[str] = None
     name: str
     organization: str
     description: str
@@ -175,6 +179,10 @@ class ProjectRead(ORMModel):
     begin: datetime
     end: datetime
     status: str
+    closed_at: Optional[datetime] = None
+    # 送審時間；有值且還沒 published_at 表示審核中
+    review_requested_at: Optional[datetime] = None
+    published_at: Optional[datetime] = None
     forms: list[LinkedFormRead] = Field(default_factory=list)
     stakeholders: list[StakeholderRead] = Field(default_factory=list)
     outcomes: list[OutcomeRead] = Field(default_factory=list)
@@ -241,3 +249,7 @@ class StakeholderSROIRead(BaseModel):
     outcomes: list[OutcomeValuationRead]
     total_social_value: Decimal
     sroi_ratio: Optional[Decimal]
+
+
+class ProjectReviewDecision(BaseModel):
+    approved: bool

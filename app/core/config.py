@@ -35,7 +35,6 @@ class Settings(BaseSettings):
     brevo_sender_email: str = ""
     brevo_sender_name: str = "SROI"
     brevo_welcome_template_id: int = 0
-    frontend_url: str = "http://localhost:5173"
 
     class Config:
         env_file = ".env"

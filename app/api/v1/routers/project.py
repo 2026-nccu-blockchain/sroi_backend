@@ -24,8 +24,11 @@ from app.core.exceptions import APIException
 from app.core.permissions import (
     accessible_project_filter,
     get_group_role,
+    get_member_project_role,
     get_user_group_roles,
     has_role,
+    can_review_projects,
+    is_project_reviewing,
     require_project_role,
 )
 from app.db.session import get_db
@@ -52,6 +55,7 @@ from app.schemas.project import (
     ProjectCostsRead,
     ProjectCreate,
     ProjectRead,
+    ProjectReviewDecision,
     StakeholderSROIRead,
     StakeholderSROIUpdate,
     ProjectUpdate,
@@ -94,13 +98,21 @@ def _project_query(db: Session):
     )
 
 
-def _get_project(db: Session, project_id: str, user_id: str, min_role: GroupRole) -> Project:
+def _get_project(
+    db: Session,
+    project_id: str,
+    user_id: str,
+    min_role: GroupRole,
+    allow_closed: bool = False,
+) -> Project:
     project = _project_query(db).filter(
         Project.project_id == project_id,
         Project.is_delete.is_(False),
     ).first()
-    role = require_project_role(db, project, user_id, min_role)
+    role = require_project_role(db, project, user_id, min_role, allow_closed=allow_closed)
     project.my_role = role.value
+    # 從共用資料庫打開別人的已發布專案時是 False，前端據此決定返回哪裡
+    project.is_member = get_member_project_role(db, project, user_id) is not None
     return project
 
 
@@ -601,6 +613,66 @@ def list_projects(
     return projects
 
 
+# 要放在 /{project_id} 之前，不然 "published" 會被當成專案 id
+@router.get("/published", response_model=list[ProjectRead])
+def list_published_projects(
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> list[Project]:
+    """共用資料庫：所有登入使用者都看得到已發布至資料庫的專案。"""
+    user_id = _user_id(payload)
+    projects = _project_query(db).options(selectinload(Project.creator)).filter(
+        Project.published_at.isnot(None),
+        Project.is_delete.is_(False),
+    ).order_by(Project.published_at.desc()).all()
+
+    # 不是成員的人也能以檢視者身分打開，跟 get_project_role 的規則一致
+    group_roles = get_user_group_roles(db, user_id)
+    for project in projects:
+        if project.is_personal:
+            role = GroupRole.LEADER if project.owner_id == user_id else None
+        else:
+            role = group_roles.get(project.group_id)
+        project.is_member = role is not None
+        project.my_role = (role or GroupRole.VIEWER).value
+        # 作者：建立專案的人
+        project.creator_name = project.creator.name if project.creator else None
+    return projects
+
+
+def _require_reviewer(db: Session, user_id: str) -> None:
+    if not can_review_projects(db, user_id):
+        raise APIException(403, "30019", "只有資料庫編輯者或管理員能審核專案")
+
+
+# 同樣要放在 /{project_id} 之前
+@router.get("/reviewing", response_model=list[ProjectRead])
+def list_reviewing_projects(
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> list[Project]:
+    """審核專案：資料庫編輯者、管理員看得到所有審核中的專案，依送審時間排序。"""
+    user_id = _user_id(payload)
+    _require_reviewer(db, user_id)
+    projects = _project_query(db).options(selectinload(Project.creator)).filter(
+        Project.closed_at.isnot(None),
+        Project.review_requested_at.isnot(None),
+        Project.published_at.is_(None),
+        Project.is_delete.is_(False),
+    ).order_by(Project.review_requested_at.asc()).all()
+
+    group_roles = get_user_group_roles(db, user_id)
+    for project in projects:
+        if project.is_personal:
+            role = GroupRole.LEADER if project.owner_id == user_id else None
+        else:
+            role = group_roles.get(project.group_id)
+        project.is_member = role is not None
+        project.my_role = (role or GroupRole.VIEWER).value
+        project.creator_name = project.creator.name if project.creator else None
+    return projects
+
+
 @router.post("", response_model=ProjectRead, status_code=status.HTTP_201_CREATED)
 def create_project(
     data: ProjectCreate,
@@ -813,9 +885,79 @@ def delete_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> None:
-    project = _get_project(db, project_id, _user_id(payload), GroupRole.LEADER)
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.LEADER, allow_closed=True)
     project.is_delete = True
     db.commit()
+
+
+@router.post("/{project_id}/close", response_model=ProjectRead)
+def close_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """結案：只有組長能做，且專案期間結束後（待結案）才能結案；結案後無法復原。"""
+    user_id = _user_id(payload)
+    project = _get_project(db, project_id, user_id, GroupRole.LEADER, allow_closed=True)
+    if project.closed_at is not None:
+        raise APIException(409, "30014", "專案已結案")
+    if datetime.now(timezone.utc) <= _as_aware(project.end):
+        raise APIException(400, "30015", "專案期間尚未結束，還不能結案")
+    project.closed_at = datetime.now(timezone.utc)
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
+
+
+@router.post("/{project_id}/publish", response_model=ProjectRead)
+def publish_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """發布至資料庫：只有組長能做，且必須先結案；送出後進入審核，資料庫編輯者同意後才會發布。"""
+    user_id = _user_id(payload)
+    project = _get_project(db, project_id, user_id, GroupRole.LEADER, allow_closed=True)
+    if project.closed_at is None:
+        raise APIException(400, "30016", "專案結案後才能發布至資料庫")
+    if project.published_at is not None:
+        raise APIException(409, "30017", "專案已發布至資料庫")
+    if project.review_requested_at is not None:
+        raise APIException(409, "30018", "專案審核中")
+    project.review_requested_at = datetime.now(timezone.utc)
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
+
+
+@router.post("/{project_id}/review", response_model=ProjectRead)
+def review_project(
+    project_id: str,
+    data: ProjectReviewDecision,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """審核專案：只有資料庫編輯者、管理員能做。同意則發布至資料庫；不同意則退回已結案，不會出現在共用資料庫。"""
+    user_id = _user_id(payload)
+    _require_reviewer(db, user_id)
+    project = _project_query(db).filter(
+        Project.project_id == project_id,
+        Project.is_delete.is_(False),
+    ).first()
+    if project is None:
+        raise APIException(404, "30001", "Project not found")
+    if not is_project_reviewing(project):
+        raise APIException(409, "30020", "專案不在審核中")
+    if data.approved:
+        project.published_at = datetime.now(timezone.utc)
+    else:
+        project.review_requested_at = None
+    db.commit()
+
+    # 不同意後資料庫編輯者就看不到這個專案了，所以不走 _get_project 的權限檢查
+    project = _project_query(db).filter(Project.project_id == project_id).first()
+    member_role = get_member_project_role(db, project, user_id)
+    project.is_member = member_role is not None
+    project.my_role = (member_role or GroupRole.VIEWER).value
+    return project
 
 
 @router.post(

@@ -296,6 +296,10 @@ class Project(Base):
     sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
     outcome_sync_sequence = Column(Integer, nullable=False, default=0, server_default="0")
     status = Column(String(20), nullable=False, default="draft")
+    # 結案後專案內容不能再修改；結案後送出發布會先進入審核，資料庫編輯者同意後才算發布
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    review_requested_at = Column(DateTime(timezone=True), nullable=True)  # 送審時間；不同意時清回 null
+    published_at = Column(DateTime(timezone=True), nullable=True)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
