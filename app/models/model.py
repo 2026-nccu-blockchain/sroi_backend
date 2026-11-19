@@ -173,6 +173,11 @@ class Form(Base):
     status = Column(SQLEnum(FormStatus), nullable=False, default=FormStatus.DRAFT)
     shuffle_outcome_questions = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     outcome_sync_index = Column(Integer, nullable=False, default=0, server_default="0")
+    published_consent_id = Column(
+        String(36),
+        ForeignKey("form_consents.consent_id", ondelete="SET NULL"),
+        nullable=True,
+    )
     result_id_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -184,6 +189,16 @@ class Form(Base):
     answers = relationship("Answer", back_populates="form")
 
     responses = relationship("FormResponse", back_populates="form")
+    consent_versions = relationship(
+        "FormConsent",
+        back_populates="form",
+        foreign_keys="FormConsent.form_id",
+    )
+    published_consent = relationship(
+        "FormConsent",
+        foreign_keys=[published_consent_id],
+        post_update=True,
+    )
     project = relationship("Project", back_populates="forms", foreign_keys=[project_id])
     pre_test_stakeholders = relationship(
         "ProjectStakeholder",
@@ -195,6 +210,67 @@ class Form(Base):
         back_populates="post_form",
         foreign_keys="ProjectStakeholder.post_form_id",
     )
+
+    @property
+    def draft_consent(self):
+        return next(
+            (
+                consent
+                for consent in self.consent_versions
+                if not consent.is_published and not consent.is_delete
+            ),
+            None,
+        )
+
+
+class FormConsent(Base):
+    __tablename__ = "form_consents"
+    __table_args__ = (
+        UniqueConstraint("form_id", "version", name="uq_form_consent_version"),
+        Index(
+            "uq_form_consent_draft",
+            "form_id",
+            unique=True,
+            postgresql_where=text("is_published = false AND is_delete = false"),
+        ),
+    )
+
+    consent_id = Column(
+        String(36),
+        primary_key=True,
+        index=True,
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+    )
+    form_id = Column(
+        String(36),
+        ForeignKey("forms.form_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version = Column(Integer, nullable=False, default=0)
+    is_published = Column(Boolean, nullable=False, default=False, server_default="false")
+    title = Column(String(255), nullable=False)
+    organization_name = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False)
+    secondary_use_description = Column(Text, nullable=False, default="")
+    withdrawal_method = Column(Text, nullable=False, default="")
+    contact_name = Column(String(255), nullable=False, default="")
+    contact_email = Column(String(255), nullable=False, default="")
+    contact_phone = Column(String(100), nullable=False, default="")
+    requires_guardian = Column(Boolean, nullable=False, default=True, server_default="true")
+    secondary_use_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    published_at = Column(DateTime(timezone=True))
+    is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    form = relationship(
+        "Form",
+        back_populates="consent_versions",
+        foreign_keys=[form_id],
+    )
+    records = relationship("ConsentRecord", back_populates="consent")
 
 
 class Project(Base):
@@ -532,6 +608,48 @@ class FormResponse(Base):
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     form = relationship("Form",back_populates="responses")
     answers = relationship("Answer",back_populates="response")
+    consent_record = relationship(
+        "ConsentRecord",
+        back_populates="response",
+        uselist=False,
+    )
+
+
+class ConsentRecord(Base):
+    __tablename__ = "consent_records"
+
+    consent_record_id = Column(
+        String(36),
+        primary_key=True,
+        index=True,
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+    )
+    response_id = Column(
+        String(36),
+        ForeignKey("form_responses.response_id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    consent_id = Column(
+        String(36),
+        ForeignKey("form_consents.consent_id"),
+        nullable=False,
+        index=True,
+    )
+    respondent_email = Column(String(255), nullable=False)
+    participant_name = Column(String(255), nullable=False)
+    participant_agreed = Column(Boolean, nullable=False)
+    secondary_use_agreed = Column(Boolean, nullable=False, default=False, server_default="false")
+    is_adult = Column(Boolean, nullable=False)
+    guardian_name = Column(String(255))
+    guardian_relationship = Column(String(100))
+    guardian_agreed = Column(Boolean)
+    consented_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    response = relationship("FormResponse", back_populates="consent_record")
+    consent = relationship("FormConsent", back_populates="records")
 
 class Answer(Base):
     __tablename__ = "answers"
