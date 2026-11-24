@@ -94,6 +94,8 @@ class VerifiedCode(Base):
     uuid = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), nullable=False, index=True)
     code_hash = Column(String(64), nullable=False)
+    # 用途：register 註冊、reset_password 忘記密碼；兩種驗證碼不能互用
+    purpose = Column(String(20), nullable=False, default="register", server_default="register")
     expires_at = Column(DateTime(timezone=True), nullable=False)
     attempts = Column(Integer, nullable=False, default=0)  # 輸入錯誤的次數
     is_verified = Column(Boolean, nullable=False, default=False)

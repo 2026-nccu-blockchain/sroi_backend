@@ -20,6 +20,18 @@ class RegisterRequest(BaseModel):
     password: str
     name: str
 
+# 忘記密碼：寄驗證碼 → 驗證碼換 reset_token → 用 reset_token 設定新密碼
+class ForgotPasswordSendCodeRequest(BaseModel):
+    email_prefix: str
+
+class ForgotPasswordVerifyCodeRequest(BaseModel):
+    email_prefix: str
+    code: str
+
+class ResetPasswordRequest(BaseModel):
+    reset_token: str
+    new_password: str
+
 class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str

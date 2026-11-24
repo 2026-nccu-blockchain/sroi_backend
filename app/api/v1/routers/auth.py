@@ -5,7 +5,14 @@ from app.models.model import Role, Account, VerifiedCode, EMAIL_DOMAIN
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta, timezone
-from app.core.jwt import create_access_token, create_register_token, decode_register_token
+from app.core.jwt import (
+    create_access_token,
+    create_register_token,
+    create_reset_token,
+    decode_register_token,
+    decode_reset_token,
+    password_fingerprint,
+)
 from app.core.deps import verify_token, return_payload
 from app.api.services.email import send_verification_code_email
 from app.api.services.enrollment import (
@@ -22,7 +29,10 @@ from app.schemas.auth import (
     SendCodeRequest,
     VerifyCodeRequest,
     RegisterRequest,
-    ChangePasswordRequest
+    ChangePasswordRequest,
+    ForgotPasswordSendCodeRequest,
+    ForgotPasswordVerifyCodeRequest,
+    ResetPasswordRequest,
 )
 import hashlib
 import logging
@@ -38,6 +48,9 @@ CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 CODE_EXPIRE_MINUTES = 5
 CODE_MAX_ATTEMPTS = 5
 CODE_RESEND_SECONDS = 60
+# 驗證碼用途；註冊與忘記密碼的驗證碼不能互用
+PURPOSE_REGISTER = "register"
+PURPOSE_RESET = "reset_password"
 
 
 def generate_code() -> str:
@@ -103,6 +116,70 @@ def user_login(data: LoginRequest, db: Session = Depends(get_db)) -> dict:
     )
 
 
+def issue_code(db: Session, email_prefix: str, purpose: str) -> None:
+    """寄出新的驗證碼：同一用途 60 秒內不能重寄，舊的未使用驗證碼作廢"""
+    now = datetime.now(timezone.utc)
+    latest = db.query(VerifiedCode).filter(
+        VerifiedCode.email == email_prefix,
+        VerifiedCode.purpose == purpose,
+    ).order_by(VerifiedCode.create_time.desc()).first()
+    # 避免一直按重寄灌爆信箱
+    if latest is not None and now - latest.create_time < timedelta(seconds=CODE_RESEND_SECONDS):
+        raise APIException(400, "10024", "please wait before resending")
+    db.query(VerifiedCode).filter(
+        VerifiedCode.email == email_prefix,
+        VerifiedCode.purpose == purpose,
+        VerifiedCode.is_verified == False,
+        VerifiedCode.is_delete == False,
+    ).update({VerifiedCode.is_delete: True}, synchronize_session=False)
+    code = generate_code()
+    db.add(VerifiedCode(
+        email=email_prefix,
+        code_hash=hash_code(code),
+        purpose=purpose,
+        expires_at=now + timedelta(minutes=CODE_EXPIRE_MINUTES),
+        # 用程式時間：資料庫的 now() 在同一交易內相同，重寄間隔與「最新一筆」會判斷錯
+        create_time=now,
+    ))
+    try:
+        send_verification_code_email(
+            recipient_email=email_prefix + EMAIL_DOMAIN,
+            code=code,
+            expire_minutes=CODE_EXPIRE_MINUTES,
+            purpose=purpose,
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("驗證碼寄送失敗：%s", email_prefix)
+        raise APIException(500, "10028", "failed to send verification email")
+    db.commit()
+
+
+def check_code(db: Session, email_prefix: str, purpose: str, code: str) -> None:
+    """驗證碼正確就標記已使用；過期、錯誤都丟出對應的錯誤（錯 5 次作廢）"""
+    record = db.query(VerifiedCode).filter(
+        VerifiedCode.email == email_prefix,
+        VerifiedCode.purpose == purpose,
+        VerifiedCode.is_verified == False,
+        VerifiedCode.is_delete == False,
+    ).order_by(VerifiedCode.create_time.desc()).first()
+    if record is None:
+        raise APIException(404, "10025", "verification code not found")
+    if datetime.now(timezone.utc) > record.expires_at:
+        record.is_delete = True
+        db.commit()
+        raise APIException(400, "10026", "verification code expired")
+    if not secrets.compare_digest(hash_code(code.strip().upper()), record.code_hash):
+        record.attempts += 1
+        # 錯太多次就作廢，要重新寄送
+        if record.attempts >= CODE_MAX_ATTEMPTS:
+            record.is_delete = True
+        db.commit()
+        raise APIException(400, "10027", "invalid verification code")
+    record.is_verified = True
+    db.commit()
+
+
 @router.post("/user/send_code", response_model=APIResponse, response_model_exclude_none=True)
 def send_code(data: SendCodeRequest, db: Session = Depends(get_db)) -> dict:
     email_prefix = data.email_prefix
@@ -112,29 +189,7 @@ def send_code(data: SendCodeRequest, db: Session = Depends(get_db)) -> dict:
     disabled = disabled_account(db, email_prefix)
     if disabled is not None:
         raise_disabled(disabled)
-    now = datetime.now(timezone.utc)
-    latest = db.query(VerifiedCode).filter(VerifiedCode.email == email_prefix).order_by(VerifiedCode.create_time.desc()).first()
-    # 避免一直按重寄灌爆信箱
-    if latest is not None and now - latest.create_time < timedelta(seconds=CODE_RESEND_SECONDS):
-        raise APIException(400, "10024", "please wait before resending")
-    db.query(VerifiedCode).filter(
-        VerifiedCode.email == email_prefix,
-        VerifiedCode.is_verified == False,
-        VerifiedCode.is_delete == False,
-    ).update({VerifiedCode.is_delete: True}, synchronize_session=False)
-    code = generate_code()
-    db.add(VerifiedCode(
-        email=email_prefix,
-        code_hash=hash_code(code),
-        expires_at=now + timedelta(minutes=CODE_EXPIRE_MINUTES),
-    ))
-    try:
-        send_verification_code_email(recipient_email=email_prefix + EMAIL_DOMAIN, code=code, expire_minutes=CODE_EXPIRE_MINUTES)
-    except Exception:
-        db.rollback()
-        logger.exception("驗證碼寄送失敗：%s", email_prefix)
-        raise APIException(500, "10028", "failed to send verification email")
-    db.commit()
+    issue_code(db, email_prefix, PURPOSE_REGISTER)
 
     return APIResponse(
         status_code="00000",
@@ -146,32 +201,74 @@ def send_code(data: SendCodeRequest, db: Session = Depends(get_db)) -> dict:
 @router.post("/user/verify_code", response_model=APIResponse, response_model_exclude_none=True)
 def verify_code(data: VerifyCodeRequest, db: Session = Depends(get_db)) -> dict:
     email = data.email_prefix
-    record = db.query(VerifiedCode).filter(
-        VerifiedCode.email == email,
-        VerifiedCode.is_verified == False,
-        VerifiedCode.is_delete == False,
-    ).order_by(VerifiedCode.create_time.desc()).first()
-    if record is None:
-        raise APIException(404, "10025", "verification code not found")
-    if datetime.now(timezone.utc) > record.expires_at:
-        record.is_delete = True
-        db.commit()
-        raise APIException(400, "10026", "verification code expired")
-    if not secrets.compare_digest(hash_code(data.code.strip().upper()), record.code_hash):
-        record.attempts += 1
-        # 錯太多次就作廢，要重新寄送
-        if record.attempts >= CODE_MAX_ATTEMPTS:
-            record.is_delete = True
-        db.commit()
-        raise APIException(400, "10027", "invalid verification code")
-    record.is_verified = True
-    db.commit()
+    check_code(db, email, PURPOSE_REGISTER, data.code)
 
     return APIResponse(
         status_code="00000",
         message="success",
         response_datetime=datetime.now(),
         register_token=create_register_token(email),
+    )
+
+
+def active_account_for_reset(db: Session, email_prefix: str) -> Account:
+    """忘記密碼的帳號：要存在；被停權或逾期未驗證的直接告知，不能用重設密碼繞過"""
+    user = db.query(Account).filter(Account.email == email_prefix, Account.is_delete == False).first()
+    if user is not None:
+        return user
+    disabled = disabled_account(db, email_prefix)
+    if disabled is not None:
+        raise_disabled(disabled)
+    raise APIException(404, "10001", "user not found")
+
+
+@router.post("/user/forgot_password/send_code", response_model=APIResponse, response_model_exclude_none=True)
+def forgot_password_send_code(data: ForgotPasswordSendCodeRequest, db: Session = Depends(get_db)) -> dict:
+    """忘記密碼第 1 步：寄重設密碼的驗證碼到政大信箱"""
+    active_account_for_reset(db, data.email_prefix)
+    issue_code(db, data.email_prefix, PURPOSE_RESET)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/user/forgot_password/verify_code", response_model=APIResponse, response_model_exclude_none=True)
+def forgot_password_verify_code(data: ForgotPasswordVerifyCodeRequest, db: Session = Depends(get_db)) -> dict:
+    """忘記密碼第 2 步：驗證碼正確就發 15 分鐘有效、只能用一次的 reset_token"""
+    user = active_account_for_reset(db, data.email_prefix)
+    check_code(db, data.email_prefix, PURPOSE_RESET, data.code)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        reset_token=create_reset_token(user.email, user.hash_password),
+    )
+
+
+@router.post("/user/forgot_password/reset", response_model=APIResponse, response_model_exclude_none=True)
+def forgot_password_reset(data: ResetPasswordRequest, db: Session = Depends(get_db)) -> dict:
+    """忘記密碼第 3 步：用 reset_token 設定新密碼"""
+    try:
+        email, fingerprint = decode_reset_token(data.reset_token)
+    except Exception:
+        raise APIException(401, "10037", "invalid or expired reset token")
+    user = db.query(Account).filter(Account.email == email, Account.is_delete == False).first()
+    # 密碼已經改過（token 用過了）或帳號已被停用，token 都不能再用
+    if user is None or not secrets.compare_digest(password_fingerprint(user.hash_password), fingerprint):
+        raise APIException(401, "10037", "invalid or expired reset token")
+    if not is_strong_password(data.new_password):
+        raise APIException(400, "10010", "password is not strong")
+    user.set_password(data.new_password)
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
     )
 
 

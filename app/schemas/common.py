@@ -12,6 +12,7 @@ class APIResponse(BaseModel):
     # 其他欄位依需求加
     token: Optional[str] = None
     register_token: Optional[str] = None
+    reset_token: Optional[str] = None
     user_id: Optional[str] = None
     campus_id: Optional[str] = None
     email: Optional[str] = None

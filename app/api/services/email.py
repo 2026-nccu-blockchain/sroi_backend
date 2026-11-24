@@ -111,13 +111,37 @@ def send_html_email(
     return response.message_id
 
 
-def send_verification_code_email(*, recipient_email: str, code: str, expire_minutes: int) -> str:
-    """寄送註冊驗證碼；信中只有驗證碼，沒有任何連結"""
+# 驗證碼信件依用途換文字；模板相同
+VERIFICATION_EMAIL_TEXTS = {
+    "register": {
+        "subject": "社會影響力評估平台註冊驗證碼",
+        "heading": "註冊驗證碼",
+        "instruction": "請複製下方驗證碼，回到註冊頁面填入以完成 Email 驗證。",
+        "ignore_text": "如果你沒有申請註冊社會影響力評估平台，可以忽略此信件。",
+    },
+    "reset_password": {
+        "subject": "社會影響力評估平台重設密碼驗證碼",
+        "heading": "重設密碼驗證碼",
+        "instruction": "請複製下方驗證碼，回到忘記密碼頁面填入，即可設定新密碼。",
+        "ignore_text": "如果你沒有申請重設密碼，可以忽略此信件，你的密碼不會改變。",
+    },
+}
+
+
+def send_verification_code_email(
+    *, recipient_email: str, code: str, expire_minutes: int, purpose: str = "register"
+) -> str:
+    """寄送驗證碼（註冊或忘記密碼）；信中只有驗證碼，沒有任何連結"""
+    texts = VERIFICATION_EMAIL_TEXTS[purpose]
     template = Template((EMAIL_TEMPLATE_DIR / "verification_code.html").read_text(encoding="utf-8"))
-    html_content = template.substitute(code=escape(code), expire_minutes=expire_minutes)
+    html_content = template.substitute(
+        code=escape(code),
+        expire_minutes=expire_minutes,
+        **{key: escape(value) for key, value in texts.items()},
+    )
     return send_html_email(
         recipient_email=recipient_email,
-        recipient_name="使用者", 
-        subject="社會影響力評估平台註冊驗證碼",
+        recipient_name="使用者",
+        subject=texts["subject"],
         html_content=html_content,
     )

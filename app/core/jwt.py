@@ -1,3 +1,5 @@
+import hashlib
+
 import jwt
 from datetime import datetime, timedelta
 from app.core.config import get_settings
@@ -33,3 +35,31 @@ def decode_register_token(token: str) -> str:
     if payload.get("purpose") != REGISTER_TOKEN_PURPOSE or not isinstance(payload.get("email"), str):
         raise jwt.InvalidTokenError("Not a register token")
     return payload["email"]
+
+
+RESET_TOKEN_PURPOSE = "reset_password"
+
+
+def password_fingerprint(hash_password: str) -> str:
+    """目前密碼雜湊的指紋：重設後密碼改變，舊的重設 token 就失效（只能用一次）"""
+    return hashlib.sha256(hash_password.encode("utf-8")).hexdigest()[:16]
+
+
+def create_reset_token(email: str, hash_password: str, expires_delta: timedelta = timedelta(minutes=15)) -> str:
+    return create_access_token(
+        {"email": email, "purpose": RESET_TOKEN_PURPOSE, "pwd": password_fingerprint(hash_password)},
+        expires_delta,
+    )
+
+
+def decode_reset_token(token: str) -> tuple[str, str]:
+    """回傳 (email, 密碼指紋)"""
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    if (
+        payload.get("purpose") != RESET_TOKEN_PURPOSE
+        or not isinstance(payload.get("email"), str)
+        or not isinstance(payload.get("pwd"), str)
+    ):
+        raise jwt.InvalidTokenError("Not a reset token")
+    return payload["email"], payload["pwd"]
+
