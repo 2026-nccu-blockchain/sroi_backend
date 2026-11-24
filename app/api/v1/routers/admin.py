@@ -3,18 +3,37 @@ from fastapi.responses import FileResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, selectinload
 from app.db.session import get_db
-from app.models.model import Role, GroupRole, GroupStatus, Account, EnrollmentStatus, EnrollmentVerification, Group, GroupAccount
+from app.models.model import Role, GroupRole, GroupStatus, Account, EnrollmentStatus, EnrollmentVerification, ExternalInvitation, Group, GroupAccount
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
 from app.core.permissions import count_group_leaders, get_group_members
 from app.schemas.admin import (
+    ExtendExternalRequest,
+    ExternalInviteRequest,
     RejectEnrollmentRequest,
     UnconfirmGroupRequest
 )
 from app.api.services.enrollment import DELETE_REASON_SUSPENDED, serialize_enrollment, soft_delete_account
 from app.api.services.enrollment_files import enrollment_file_path
+from app.api.services.email import send_external_invitation_email
+from app.api.services.external_accounts import (
+    INVITE_LINK_DAYS,
+    account_extra,
+    extend_valid_until,
+    is_external,
+    new_nonce,
+    normalize_external_email,
+    now_utc,
+    serialize_invitation,
+)
+from app.api.services.enrollment import DISABLED_REASONS, TAIPEI
+from app.core.config import get_settings
+from app.core.jwt import create_invite_token
+import logging
+
+logger = logging.getLogger(__name__)
 import re
 
 router = APIRouter()
@@ -201,7 +220,9 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             {
                 "user_id": a.user_id,
                 "campus_id": a.campus_id,
-                "name": a.name
+                "name": a.name,
+                "account_type": a.account_type,
+                "organization": a.organization
             }
             for a in admin
         ],
@@ -209,7 +230,9 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             {
                 "user_id": de.user_id,
                 "campus_id": de.campus_id,
-                "name": de.name
+                "name": de.name,
+                "account_type": de.account_type,
+                "organization": de.organization
             }
             for de in db_editor
         ],
@@ -217,7 +240,9 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             {
                 "user_id": nu.user_id,
                 "campus_id": nu.campus_id,
-                "name": nu.name
+                "name": nu.name,
+                "account_type": nu.account_type,
+                "organization": nu.organization
             }
             for nu in normal_user
         ],
@@ -258,6 +283,7 @@ def show_one_user(request: Request, UserId: str, db: Session = Depends(get_db)) 
         email=user.email,
         role=user.role.value,
         enrollment=serialize_enrollment(db, user),
+        **account_extra(user),
     )
 
 
@@ -506,3 +532,144 @@ def group_search_user(request: Request, Search: str, db: Session = Depends(get_d
             for user in users
         ],
     )
+
+
+def active_invitation(db: Session, invitation_id: str) -> ExternalInvitation:
+    invitation = db.query(ExternalInvitation).filter(
+        ExternalInvitation.invitation_id == invitation_id,
+        ExternalInvitation.is_delete == False,
+        ExternalInvitation.accepted_at.is_(None),
+    ).first()
+    if invitation is None:
+        raise APIException(404, "10041", "invitation not found")
+    return invitation
+
+
+def send_invitation(db: Session, invitation: ExternalInvitation) -> None:
+    """產生新的連結（7 天）並寄信；寄信失敗就整筆不寫入"""
+    invitation.token_nonce = new_nonce()
+    invitation.expires_at = now_utc() + timedelta(days=INVITE_LINK_DAYS)
+    db.flush()
+    token = create_invite_token(invitation.invitation_id, invitation.token_nonce, invitation.expires_at)
+    link = f"{get_settings().frontend_base_url.rstrip('/')}/auth/accept-invite?token={token}"
+    expires_text = invitation.expires_at.astimezone(TAIPEI).strftime("%Y/%m/%d %H:%M")
+    try:
+        send_external_invitation_email(
+            recipient_email=invitation.email,
+            link=link,
+            organization=invitation.organization,
+            valid_years=invitation.valid_years,
+            expires_text=expires_text,
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("校外邀請信寄送失敗：%s", invitation.email)
+        raise APIException(500, "10028", "failed to send invitation email")
+    db.commit()
+
+
+@router.post("/external_invitations", response_model=APIResponse, response_model_exclude_none=True)
+def invite_external(request: Request, data: ExternalInviteRequest, db: Session = Depends(get_db)) -> dict:
+    """邀請校外人士：寄出 7 天有效的設定密碼連結；對方完成設定才建立帳號"""
+    admin = require_admin(request, db)
+    email = normalize_external_email(data.email)
+    if db.query(Account).filter(Account.email == email, Account.is_delete == False).first() is not None:
+        raise APIException(400, "10006", "register duplicate")
+    # 被停權的 email 不能再邀請
+    if db.query(Account).filter(
+        Account.email == email, Account.is_delete == True, Account.delete_reason.in_(DISABLED_REASONS)
+    ).first() is not None:
+        raise APIException(403, "10035", "account suspended")
+    # 同一個 email 已經在邀請中，新的取代舊的（舊連結失效）
+    db.query(ExternalInvitation).filter(
+        ExternalInvitation.email == email,
+        ExternalInvitation.is_delete == False,
+        ExternalInvitation.accepted_at.is_(None),
+    ).update({ExternalInvitation.is_delete: True}, synchronize_session=False)
+    invitation = ExternalInvitation(
+        email=email,
+        organization=data.organization,
+        valid_years=data.valid_years,
+        invited_by=admin.user_id,
+        token_nonce=new_nonce(),
+        expires_at=now_utc(),
+        # 用程式時間：資料庫的 now() 在同一交易內相同，排不出先後
+        create_time=now_utc(),
+    )
+    db.add(invitation)
+    send_invitation(db, invitation)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        invitation=serialize_invitation(invitation),
+    )
+
+
+@router.get("/external_invitations", response_model=APIResponse, response_model_exclude_none=True)
+def list_external_invitations(request: Request, db: Session = Depends(get_db)) -> dict:
+    """還沒完成設定的邀請（含連結已過期的），最新的在前"""
+    require_admin(request, db)
+    invitations = db.query(ExternalInvitation).filter(
+        ExternalInvitation.is_delete == False,
+        ExternalInvitation.accepted_at.is_(None),
+    ).order_by(ExternalInvitation.create_time.desc()).all()
+    now = now_utc()
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        invitations=[serialize_invitation(invitation, now) for invitation in invitations],
+    )
+
+
+@router.post("/external_invitations/{InvitationId}/resend", response_model=APIResponse, response_model_exclude_none=True)
+def resend_external_invitation(request: Request, InvitationId: str, db: Session = Depends(get_db)) -> dict:
+    """重寄：舊連結失效，新連結重新計算 7 天"""
+    require_admin(request, db)
+    invitation = active_invitation(db, InvitationId)
+    send_invitation(db, invitation)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        invitation=serialize_invitation(invitation),
+    )
+
+
+@router.delete("/external_invitations/{InvitationId}", response_model=APIResponse, response_model_exclude_none=True)
+def cancel_external_invitation(request: Request, InvitationId: str, db: Session = Depends(get_db)) -> dict:
+    """取消邀請：連結立即失效"""
+    require_admin(request, db)
+    invitation = active_invitation(db, InvitationId)
+    invitation.is_delete = True
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/extend_external/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def extend_external(request: Request, UserId: str, data: ExtendExternalRequest, db: Session = Depends(get_db)) -> dict:
+    """延長校外帳號：還沒到期從原到期日往後加，已到期從今天起算"""
+    require_admin(request, db)
+    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    if not is_external(user):
+        raise APIException(400, "10042", "not an external account")
+    extend_valid_until(user, data.years)
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        valid_until=user.valid_until,
+    )
+

@@ -7,6 +7,7 @@ from app.schemas.common import APIResponse
 from datetime import datetime, timedelta, timezone
 from app.core.deps import require_enrollment_access, verify_token, return_payload
 from app.api.services.enrollment import UPLOADABLE_STATES, enrollment_state, serialize_enrollment
+from app.api.services.external_accounts import account_extra, is_external_expired
 from app.api.services.enrollment_files import detect_enrollment_type, read_enrollment_file, save_enrollment_file
 from app.schemas.user import (
     AddGroupRequest,
@@ -116,8 +117,8 @@ def my_profile(request: Request, db: Session = Depends(get_db)) -> dict:
     payload = return_payload(request)
     user_id = payload["user_id"]
     user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
-    # 帳號已被停權或刪除：回 401 讓前端登出，不要停在錯誤畫面
-    if user is None:
+    # 帳號已被停權、刪除，或校外帳號已到期：回 401 讓前端登出，不要停在錯誤畫面
+    if user is None or is_external_expired(user):
         raise APIException(401, "10005", "Invalid or expired token")
 
     return APIResponse(
@@ -131,6 +132,7 @@ def my_profile(request: Request, db: Session = Depends(get_db)) -> dict:
         role=user.role.value,
         # 前端用 enrollment.state 決定要不要導到驗證頁
         enrollment=serialize_enrollment(db, user),
+        **account_extra(user),
     )
 
 

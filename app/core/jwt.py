@@ -63,3 +63,27 @@ def decode_reset_token(token: str) -> tuple[str, str]:
         raise jwt.InvalidTokenError("Not a reset token")
     return payload["email"], payload["pwd"]
 
+
+INVITE_TOKEN_PURPOSE = "external_invite"
+
+
+def create_invite_token(invitation_id: str, nonce: str, expires_at: datetime) -> str:
+    """校外邀請連結的 token；nonce 存在邀請資料裡，重寄時更換，舊連結就失效"""
+    return jwt.encode(
+        {"purpose": INVITE_TOKEN_PURPOSE, "invitation_id": invitation_id, "nonce": nonce, "exp": expires_at},
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def decode_invite_token(token: str) -> tuple[str, str]:
+    """回傳 (invitation_id, nonce)"""
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    if (
+        payload.get("purpose") != INVITE_TOKEN_PURPOSE
+        or not isinstance(payload.get("invitation_id"), str)
+        or not isinstance(payload.get("nonce"), str)
+    ):
+        raise jwt.InvalidTokenError("Not an invite token")
+    return payload["invitation_id"], payload["nonce"]
+

@@ -37,6 +37,12 @@ class APIResponse(BaseModel):
     admin: Optional[list] = None
     db_editor: Optional[list] = None
     normal_user: Optional[list] = None
+    # 校外帳號
+    account_type: Optional[str] = None
+    organization: Optional[str] = None
+    valid_until: Optional[datetime] = None
+    invitation: Optional[dict] = None
+    invitations: Optional[list] = None
     # 在學驗證
     enrollment: Optional[dict] = None
     enrollment_pending_user: Optional[list] = None

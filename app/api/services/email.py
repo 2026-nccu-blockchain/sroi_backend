@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from string import Template
@@ -13,6 +14,14 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 EMAIL_TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "templates" / "email"
+# 版權年份用台灣時間；台灣沒有日光節約，用固定時差即可
+TAIPEI = timezone(timedelta(hours=8))
+
+
+def render_email_template(name: str, **params) -> str:
+    """讀取信件模板並填入參數；頁尾版權年份自動使用寄信當下的年份"""
+    template = Template((EMAIL_TEMPLATE_DIR / name).read_text(encoding="utf-8"))
+    return template.substitute(copyright_year=datetime.now(TAIPEI).year, **params)
 
 
 def _create_brevo_client() -> sib_api_v3_sdk.TransactionalEmailsApi:
@@ -133,8 +142,8 @@ def send_verification_code_email(
 ) -> str:
     """寄送驗證碼（註冊或忘記密碼）；信中只有驗證碼，沒有任何連結"""
     texts = VERIFICATION_EMAIL_TEXTS[purpose]
-    template = Template((EMAIL_TEMPLATE_DIR / "verification_code.html").read_text(encoding="utf-8"))
-    html_content = template.substitute(
+    html_content = render_email_template(
+        "verification_code.html",
         code=escape(code),
         expire_minutes=expire_minutes,
         **{key: escape(value) for key, value in texts.items()},
@@ -145,3 +154,24 @@ def send_verification_code_email(
         subject=texts["subject"],
         html_content=html_content,
     )
+
+
+def send_external_invitation_email(
+    *, recipient_email: str, link: str, organization: str, valid_years: int, expires_text: str
+) -> str:
+    """寄送校外人士帳號邀請；連結開啟後設定姓名與密碼才建立帳號"""
+    html_content = render_email_template(
+        "external_invitation.html",
+        email=escape(recipient_email),
+        organization=escape(organization),
+        valid_years=valid_years,
+        link=escape(link, quote=True),
+        expires_text=escape(expires_text),
+    )
+    return send_html_email(
+        recipient_email=recipient_email,
+        recipient_name="使用者",
+        subject="社會影響力評估平台帳號邀請",
+        html_content=html_content,
+    )
+

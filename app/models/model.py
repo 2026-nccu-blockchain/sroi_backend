@@ -44,6 +44,8 @@ class ResponseStatus(Enum):
 
 # email 欄位只存 @ 前面的部分，寄信時才補上網域
 EMAIL_DOMAIN = "@nccu.edu.tw"
+ACCOUNT_NCCU = "nccu"
+ACCOUNT_EXTERNAL = "external"
 
 
 class Account(Base):
@@ -52,7 +54,12 @@ class Account(Base):
     # 學號：email 前綴是 9 碼數字才是學生，學號就是前綴；其他帳號是 None
     campus_id = Column(String(36))
     user_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    # 政大帳號只存 email 前綴；校外帳號存完整 email（小寫）
     email = Column(String(255), nullable=False)
+    # nccu 政大師生（自行註冊）；external 校外人士（管理員邀請）
+    account_type = Column(String(20), nullable=False, default=ACCOUNT_NCCU, server_default=ACCOUNT_NCCU)
+    organization = Column(String(255), nullable=True)  # 校外人士的所屬單位
+    valid_until = Column(DateTime(timezone=True), nullable=True)  # 校外帳號到期時間；到期後不能登入，管理員可延長
     hash_password = Column(String(255), nullable=False)
     name = Column(String(20), nullable=False)
     role = Column(SQLEnum(Role), nullable=False)
@@ -86,6 +93,25 @@ class Account(Base):
     def mail_address(self) -> str:
         # 舊資料可能已經是完整 email，就不再補網域
         return self.email if "@" in self.email else self.email + EMAIL_DOMAIN
+
+
+class ExternalInvitation(Base):
+    """校外人士邀請：管理員送出後寄信，對方點連結設定姓名與密碼才建立帳號"""
+    __tablename__ = "external_invitations"
+
+    invitation_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    email = Column(String(255), nullable=False, index=True)  # 完整 email（小寫）
+    organization = Column(String(255), nullable=False)
+    valid_years = Column(Integer, nullable=False)  # 帳號使用年限，從完成註冊開始算
+    invited_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=False)
+    # 寫在連結 token 裡；重寄時更換，舊連結就失效
+    token_nonce = Column(String(64), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)  # 連結到期時間（7 天）
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    accepted_user_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=True)
+    is_delete = Column(Boolean, nullable=False, default=False)  # 取消，或被新的邀請取代
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 class VerifiedCode(Base):
