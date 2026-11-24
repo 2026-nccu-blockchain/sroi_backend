@@ -601,8 +601,14 @@ def list_projects(
     payload: dict = Depends(return_payload),
 ) -> list[Project]:
     user_id = _user_id(payload)
+    # 管理員看指定群組的專案時不限成員（管理員的群組頁）；權限仍是檢視者，由 get_project_role 決定
+    visible = (
+        Project.group_id == group_id
+        if group_id is not None and is_admin(db, user_id)
+        else accessible_project_filter(db, user_id)
+    )
     query = _project_query(db).filter(
-        accessible_project_filter(db, user_id),
+        visible,
         Project.is_delete.is_(False),
     )
     if scope == "personal":
@@ -615,8 +621,10 @@ def list_projects(
 
     group_roles = get_user_group_roles(db, user_id)
     for project in projects:
-        role = GroupRole.LEADER if project.is_personal else group_roles[project.group_id]
-        project.my_role = role.value
+        role = GroupRole.LEADER if project.is_personal else group_roles.get(project.group_id)
+        # 只有管理員看非成員群組時會是 None
+        project.is_member = role is not None
+        project.my_role = (role or GroupRole.VIEWER).value
     return projects
 
 
