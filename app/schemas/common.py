@@ -36,8 +36,9 @@ class APIResponse(BaseModel):
     admin: Optional[list] = None
     db_editor: Optional[list] = None
     normal_user: Optional[list] = None
-    change_request_user: Optional[list] = None
-    change_request: Optional[dict] = None
+    # 在學驗證
+    enrollment: Optional[dict] = None
+    enrollment_pending_user: Optional[list] = None
     
 
 # 錯誤回應的格式 

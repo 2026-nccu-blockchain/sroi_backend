@@ -8,12 +8,19 @@ from datetime import datetime, timedelta, timezone
 from app.core.jwt import create_access_token, create_register_token, decode_register_token
 from app.core.deps import verify_token, return_payload
 from app.api.services.email import send_verification_code_email
+from app.api.services.enrollment import (
+    DELETE_REASON_ENROLLMENT,
+    EXPIRED,
+    enrollment_state,
+    initial_due_year,
+    soft_delete_account,
+    student_id_of,
+)
 from app.schemas.auth import (
     LoginRequest,
     SendCodeRequest,
     VerifyCodeRequest,
     RegisterRequest,
-    ChangeEmailRequest,
     ChangePasswordRequest
 )
 import hashlib
@@ -52,13 +59,32 @@ def is_strong_password(password: str) -> bool:
     return True
 
 
+def expired_account(db: Session, email_prefix: str):
+    """因逾期未完成在學驗證而被刪除的帳號"""
+    return db.query(Account).filter(
+        Account.email == email_prefix,
+        Account.is_delete == True,
+        Account.delete_reason == DELETE_REASON_ENROLLMENT,
+    ).order_by(Account.update_time.desc().nullslast()).first()
+
+
 @router.post("/user/login", response_model=APIResponse, response_model_exclude_none=True)
 def user_login(data: LoginRequest, db: Session = Depends(get_db)) -> dict:
     user = db.query(Account).filter(Account.email == data.email_prefix, Account.is_delete == False).first()
     if user is None:
+        # 密碼正確才告知停用原因，不透露帳號是否存在
+        expired = expired_account(db, data.email_prefix)
+        if expired is not None and expired.verify_password(data.password):
+            raise APIException(403, "10029", "account disabled: enrollment verification expired")
         raise APIException(404, "10001", "user not found")
     if not user.verify_password(data.password):
         raise APIException(400, "10002", "invalid password")
+    # 背景工作每小時才跑一次，登入時再確認一次是否已逾期
+    state, _ = enrollment_state(db, user)
+    if state == EXPIRED:
+        soft_delete_account(db, user, DELETE_REASON_ENROLLMENT)
+        db.commit()
+        raise APIException(403, "10029", "account disabled: enrollment verification expired")
     payload = {"user_id": f"{user.user_id}"}
     token = create_access_token(payload)
     
@@ -75,6 +101,9 @@ def send_code(data: SendCodeRequest, db: Session = Depends(get_db)) -> dict:
     email_prefix = data.email_prefix
     if db.query(Account).filter(Account.email == email_prefix, Account.is_delete == False).first() is not None:
         raise APIException(400, "10006", "register duplicate")
+    # 逾期未驗證被停用的學號不能重新註冊，否則會重新拿到一年
+    if expired_account(db, email_prefix) is not None:
+        raise APIException(403, "10029", "account disabled: enrollment verification expired")
     now = datetime.now(timezone.utc)
     latest = db.query(VerifiedCode).filter(VerifiedCode.email == email_prefix).order_by(VerifiedCode.create_time.desc()).first()
     # 避免一直按重寄灌爆信箱
@@ -148,37 +177,22 @@ def user_register(data: RegisterRequest, db: Session = Depends(get_db)) -> dict:
         raise APIException(400, "10006", "register duplicate")
     if not is_strong_password(data.password):
         raise APIException(400, "10010", "password is not strong")
+    if expired_account(db, email) is not None:
+        raise APIException(403, "10029", "account disabled: enrollment verification expired")
+    # email 前綴是 9 碼數字才是學生，學號就是前綴；註冊後不能改 email，所以學號固定
+    campus_id = student_id_of(email)
     new_account = Account(
         email=email,
         hash_password=" ", #不能是null，下面才會設密碼,
         name=data.name,
-        role=Role.NORMAL
+        role=Role.NORMAL,
+        campus_id=campus_id,
+        verify_due_year=initial_due_year(campus_id) if campus_id else None,
     )
     new_account.set_password(data.password)
     db.add(new_account)
     db.commit()
     db.refresh(new_account)
-
-    return APIResponse(
-        status_code="00000",
-        message="success",
-        response_datetime=datetime.now(),
-    )
-
-
-@router.put("/user/change_email", response_model=APIResponse, response_model_exclude_none=True)
-def change_email(request: Request, data: ChangeEmailRequest, db: Session = Depends(get_db)) -> dict:
-    verify_token(request)
-    payload = return_payload(request)
-    user_id = payload["user_id"]
-    user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
-    if user is None:
-        raise APIException(404, "10001", "user not found")
-    email = data.email_prefix
-    if db.query(Account).filter(Account.email == email, Account.is_delete == False).first() is not None:
-        raise APIException(400, "10006", "register duplicate")
-    user.email = email
-    db.commit()
 
     return APIResponse(
         status_code="00000",

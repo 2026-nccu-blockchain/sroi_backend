@@ -20,9 +20,6 @@ class RegisterRequest(BaseModel):
     password: str
     name: str
 
-class ChangeEmailRequest(BaseModel):
-    email_prefix: str
-
 class ChangePasswordRequest(BaseModel):
     old_password: str
     new_password: str

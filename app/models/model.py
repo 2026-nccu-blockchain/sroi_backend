@@ -49,13 +49,18 @@ EMAIL_DOMAIN = "@nccu.edu.tw"
 class Account(Base):
     __tablename__ = "accounts"
 
-    campus_id = Column(String(36)) # 教職員編號、學號
+    # 學號：email 前綴是 9 碼數字才是學生，學號就是前綴；其他帳號是 None
+    campus_id = Column(String(36))
     user_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), nullable=False)
     hash_password = Column(String(255), nullable=False)
     name = Column(String(20), nullable=False)
     role = Column(SQLEnum(Role), nullable=False)
+    # 學生下次要做在學驗證的民國年：當年 9/1 起要驗證、10/1 截止；通過後加 1。非學生是 None
+    verify_due_year = Column(Integer, nullable=True)
     is_delete = Column(Boolean, nullable=False, default=False)
+    # 刪除原因；enrollment_expired 表示沒在期限內完成在學驗證，登入時顯示停用訊息
+    delete_reason = Column(String(30), nullable=True)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -82,16 +87,6 @@ class Account(Base):
         # 舊資料可能已經是完整 email，就不再補網域
         return self.email if "@" in self.email else self.email + EMAIL_DOMAIN
 
-    @staticmethod
-    def campus_id_taken(db, campus_id: str, exclude_user_id: Optional[str] = None) -> bool:
-        query = db.query(Account).filter(
-            Account.campus_id == campus_id,
-            Account.is_delete == False,
-        )
-        if exclude_user_id is not None:
-            query = query.filter(Account.user_id != exclude_user_id)
-        return query.first() is not None
-
 
 class VerifiedCode(Base):
     __tablename__ = "verified_codes"
@@ -107,18 +102,34 @@ class VerifiedCode(Base):
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
 
-class VerifiedInProgress(Base):
-    __tablename__ = "verified_in_progress"
+class EnrollmentStatus:
+    PENDING = "pending"     # 已上傳，等管理員審核
+    APPROVED = "approved"   # 通過，帳號延長一年
+    REJECTED = "rejected"   # 退回，學生可在截止前重新上傳
 
-    # 學號變更申請
-    uuid  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    campus_id = Column(String(36), nullable=False) # 教職員編號、學號
-    user_id = Column(String(36), nullable=False)
-    is_delete = Column(Boolean, nullable=False, default=False)
+
+class EnrollmentVerification(Base):
+    """學生的在學證明；每年 9 月需要驗證時上傳，由管理員審核"""
+    __tablename__ = "enrollment_verifications"
+
+    verification_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False, index=True)
+    due_year = Column(Integer, nullable=False)  # 這份證明對應的驗證年（民國）
+    stored_name = Column(String(255), nullable=False)
+    original_name = Column(String(255), nullable=False)
+    content_type = Column(String(100), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default=EnrollmentStatus.PENDING)
+    reason = Column(Text, nullable=True)  # 退回原因
+    reviewed_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    is_delete = Column(Boolean, nullable=False, default=False)  # 審核中重新上傳時，舊的作廢
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
-    
+    user = relationship("Account", foreign_keys=[user_id])
+
+
 class Group(Base):
     __tablename__ = "groups"
 
