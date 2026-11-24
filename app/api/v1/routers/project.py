@@ -601,9 +601,12 @@ def list_projects(
     payload: dict = Depends(return_payload),
 ) -> list[Project]:
     user_id = _user_id(payload)
-    # 管理員看指定群組的專案時不限成員（管理員的群組頁）；權限仍是檢視者，由 get_project_role 決定
+    # 管理員看指定群組的專案時不限成員（管理員的群組頁）；權限仍是檢視者，由 get_project_role 決定；別人的草稿不顯示
     visible = (
-        Project.group_id == group_id
+        and_(
+            Project.group_id == group_id,
+            or_(Project.is_draft.is_(False), Project.created_by == user_id),
+        )
         if group_id is not None and is_admin(db, user_id)
         else accessible_project_filter(db, user_id)
     )
@@ -621,7 +624,13 @@ def list_projects(
 
     group_roles = get_user_group_roles(db, user_id)
     for project in projects:
-        role = GroupRole.LEADER if project.is_personal else group_roles.get(project.group_id)
+        if project.is_personal:
+            role = GroupRole.LEADER
+        elif project.is_draft:
+            # 篩選條件保證草稿一定是自己建立的；建立者對自己的草稿視同組長
+            role = GroupRole.LEADER if project.group_id in group_roles else None
+        else:
+            role = group_roles.get(project.group_id)
         # 只有管理員看非成員群組時會是 None
         project.is_member = role is not None
         project.my_role = (role or GroupRole.VIEWER).value
@@ -736,7 +745,11 @@ def list_all_projects(
             creator, creator.user_id == Project.created_by
         ).outerjoin(
             Group, Group.group_id == Project.group_id
-        ).filter(Project.is_delete.is_(False))
+        ).filter(
+            Project.is_delete.is_(False),
+            # 群組草稿只有建立者看得到，管理員也看不到
+            or_(Project.is_draft.is_(False), Project.created_by == user_id),
+        )
         if keyword:
             pattern = f"%{_escape_like(keyword)}%"
             query = query.filter(or_(
@@ -828,6 +841,8 @@ def create_project(
         begin=data.begin,
         end=data.end,
         status=data.status,
+        # 群組專案建立後先是草稿，只有建立者看得到
+        is_draft=data.group_id is not None,
     )
     saved_stakeholders = _replace_stakeholders(project, data.stakeholders)
     _, costs_sent = _apply_stakeholder_children(project, data.stakeholders, saved_stakeholders)
@@ -1024,6 +1039,25 @@ def delete_project(
     db.commit()
 
 
+@router.post("/{project_id}/make-public", response_model=ProjectRead)
+def make_project_public(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """群組草稿公開給組員：草稿只有建立者看得到，所以只有建立者能做；公開後不能改回草稿。"""
+    user_id = _user_id(payload)
+    # 別人的草稿在 get_project_role 會是 None，這裡直接回 404
+    project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
+    if project.is_personal:
+        raise APIException(400, "30022", "個人專案沒有草稿模式")
+    if not project.is_draft:
+        raise APIException(409, "30023", "專案已經公開")
+    project.is_draft = False
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
+
+
 @router.post("/{project_id}/close", response_model=ProjectRead)
 def close_project(
     project_id: str,
@@ -1035,6 +1069,8 @@ def close_project(
     project = _get_project(db, project_id, user_id, GroupRole.LEADER, allow_closed=True)
     if project.closed_at is not None:
         raise APIException(409, "30014", "專案已結案")
+    if project.is_draft:
+        raise APIException(409, "30021", "草稿需要先公開給群組才能結案")
     if datetime.now(timezone.utc) <= _as_aware(project.end):
         raise APIException(400, "30015", "專案期間尚未結束，還不能結案")
     project.closed_at = datetime.now(timezone.utc)

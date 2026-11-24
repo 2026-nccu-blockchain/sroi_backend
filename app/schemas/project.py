@@ -183,6 +183,8 @@ class ProjectRead(ORMModel):
     # 送審時間；有值且還沒 published_at 表示審核中
     review_requested_at: Optional[datetime] = None
     published_at: Optional[datetime] = None
+    # 群組專案草稿：只有建立者看得到
+    is_draft: bool = False
     forms: list[LinkedFormRead] = Field(default_factory=list)
     stakeholders: list[StakeholderRead] = Field(default_factory=list)
     outcomes: list[OutcomeRead] = Field(default_factory=list)
