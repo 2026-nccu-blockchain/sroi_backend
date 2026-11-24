@@ -192,6 +192,36 @@ class ProjectRead(ORMModel):
     update_time: Optional[datetime]
 
 
+class AdminProjectListItem(BaseModel):
+    """管理員所有專案列表的一列；只帶列表用得到的欄位"""
+    project_id: str
+    owner_id: Optional[str]
+    group_id: Optional[str]
+    name: str
+    organization: str
+    begin: datetime
+    end: datetime
+    status: str
+    closed_at: Optional[datetime] = None
+    review_requested_at: Optional[datetime] = None
+    published_at: Optional[datetime] = None
+    creator_name: Optional[str] = None
+    group_title: Optional[str] = None
+    # 取代整包 forms，只為了顯示「已發布／草稿」
+    has_published_form: bool = False
+
+
+class AdminProjectPage(BaseModel):
+    items: list[AdminProjectListItem]
+    total: int
+    page: int
+    page_size: int
+    # {"all": n, "personal": n, "group": n}
+    scope_counts: dict[str, int]
+    # 目前 scope 底下各狀態的數量：{"all": n, "not_started": n, ...}
+    phase_counts: dict[str, int]
+
+
 class OutcomeValuationInput(BaseModel):
     outcome_id: str
     quantity: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)

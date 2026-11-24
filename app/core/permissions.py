@@ -76,6 +76,14 @@ def can_review_projects(db: Session, user_id: str) -> bool:
     ).first() is not None
 
 
+def is_admin(db: Session, user_id: str) -> bool:
+    return db.query(Account).filter(
+        Account.user_id == user_id,
+        Account.role == Role.ADMIN,
+        Account.is_delete.is_(False),
+    ).first() is not None
+
+
 def is_project_reviewing(project: Project) -> bool:
     """已結案、已送審、還沒發布"""
     return project.closed_at is not None and project.review_requested_at is not None and project.published_at is None
@@ -90,6 +98,9 @@ def get_project_role(db: Session, project: Project, user_id: str) -> GroupRole |
         return GroupRole.VIEWER
     # 審核中的專案讓資料庫編輯者、管理員以檢視者身分查看；審核中一定已結案
     if is_project_reviewing(project) and can_review_projects(db, user_id):
+        return GroupRole.VIEWER
+    # 管理員可以檢視所有專案（所有專案頁）；只給檢視者，不能修改
+    if is_admin(db, user_id):
         return GroupRole.VIEWER
     return None
 
