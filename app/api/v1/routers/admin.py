@@ -13,7 +13,7 @@ from app.schemas.admin import (
     RejectEnrollmentRequest,
     UnconfirmGroupRequest
 )
-from app.api.services.enrollment import DELETE_REASON_ADMIN, serialize_enrollment, soft_delete_account
+from app.api.services.enrollment import DELETE_REASON_SUSPENDED, serialize_enrollment, soft_delete_account
 from app.api.services.enrollment_files import enrollment_file_path
 import re
 
@@ -459,23 +459,19 @@ def remove_admin(request: Request, UserId: str, db: Session = Depends(get_db)) -
     )
 
 
-@router.delete("/delete_user/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
-def delete_user(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
-    verify_token(request)
-    payload = return_payload(request)
-    admin_id = payload["user_id"]
-    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
-    if admin is None:
-        raise APIException(404, "10001", "user not found")
-    if admin.role != Role.ADMIN:
-        raise APIException(400, "10008", "permission denied")
-    if UserId == admin_id:
+@router.post("/suspend_user/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def suspend_user(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    """停權：帳號軟刪除並退出所有群組（失去組長的群組自動遞補）；之後不能用相同的學號（email 前綴）登入或重新註冊"""
+    admin = require_admin(request, db)
+    if UserId == admin.user_id:
         raise APIException(400, "10015", "can't change own permissions")
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
-    # 一併退出所有群組，失去組長的群組自動遞補
-    soft_delete_account(db, user, DELETE_REASON_ADMIN)
+    # 只能停權一般使用者；管理員、資料庫編輯者要先移除權限
+    if user.role != Role.NORMAL:
+        raise APIException(400, "10036", "demote before suspending")
+    soft_delete_account(db, user, DELETE_REASON_SUSPENDED)
     db.commit()
 
     return APIResponse(

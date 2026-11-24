@@ -116,8 +116,9 @@ def my_profile(request: Request, db: Session = Depends(get_db)) -> dict:
     payload = return_payload(request)
     user_id = payload["user_id"]
     user = db.query(Account).filter(Account.user_id == user_id, Account.is_delete == False).first()
+    # 帳號已被停權或刪除：回 401 讓前端登出，不要停在錯誤畫面
     if user is None:
-        raise APIException(404, "10001", "user not found")
+        raise APIException(401, "10005", "Invalid or expired token")
 
     return APIResponse(
         status_code="00000",

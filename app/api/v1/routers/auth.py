@@ -10,6 +10,7 @@ from app.core.deps import verify_token, return_payload
 from app.api.services.email import send_verification_code_email
 from app.api.services.enrollment import (
     DELETE_REASON_ENROLLMENT,
+    DISABLED_REASONS,
     EXPIRED,
     enrollment_state,
     initial_due_year,
@@ -59,13 +60,19 @@ def is_strong_password(password: str) -> bool:
     return True
 
 
-def expired_account(db: Session, email_prefix: str):
-    """因逾期未完成在學驗證而被刪除的帳號"""
+def disabled_account(db: Session, email_prefix: str):
+    """被停權或逾期未完成在學驗證的帳號；這兩種都不能登入，也不能用相同的 email 前綴重新註冊"""
     return db.query(Account).filter(
         Account.email == email_prefix,
         Account.is_delete == True,
-        Account.delete_reason == DELETE_REASON_ENROLLMENT,
+        Account.delete_reason.in_(DISABLED_REASONS),
     ).order_by(Account.update_time.desc().nullslast()).first()
+
+
+def raise_disabled(account: Account) -> None:
+    if account.delete_reason == DELETE_REASON_ENROLLMENT:
+        raise APIException(403, "10029", "account disabled: enrollment verification expired")
+    raise APIException(403, "10035", "account suspended")
 
 
 @router.post("/user/login", response_model=APIResponse, response_model_exclude_none=True)
@@ -73,9 +80,9 @@ def user_login(data: LoginRequest, db: Session = Depends(get_db)) -> dict:
     user = db.query(Account).filter(Account.email == data.email_prefix, Account.is_delete == False).first()
     if user is None:
         # 密碼正確才告知停用原因，不透露帳號是否存在
-        expired = expired_account(db, data.email_prefix)
-        if expired is not None and expired.verify_password(data.password):
-            raise APIException(403, "10029", "account disabled: enrollment verification expired")
+        disabled = disabled_account(db, data.email_prefix)
+        if disabled is not None and disabled.verify_password(data.password):
+            raise_disabled(disabled)
         raise APIException(404, "10001", "user not found")
     if not user.verify_password(data.password):
         raise APIException(400, "10002", "invalid password")
@@ -101,9 +108,10 @@ def send_code(data: SendCodeRequest, db: Session = Depends(get_db)) -> dict:
     email_prefix = data.email_prefix
     if db.query(Account).filter(Account.email == email_prefix, Account.is_delete == False).first() is not None:
         raise APIException(400, "10006", "register duplicate")
-    # 逾期未驗證被停用的學號不能重新註冊，否則會重新拿到一年
-    if expired_account(db, email_prefix) is not None:
-        raise APIException(403, "10029", "account disabled: enrollment verification expired")
+    # 停權、逾期未驗證的學號（email 前綴）不能重新註冊；逾期的重新註冊會再拿到一年
+    disabled = disabled_account(db, email_prefix)
+    if disabled is not None:
+        raise_disabled(disabled)
     now = datetime.now(timezone.utc)
     latest = db.query(VerifiedCode).filter(VerifiedCode.email == email_prefix).order_by(VerifiedCode.create_time.desc()).first()
     # 避免一直按重寄灌爆信箱
@@ -177,8 +185,9 @@ def user_register(data: RegisterRequest, db: Session = Depends(get_db)) -> dict:
         raise APIException(400, "10006", "register duplicate")
     if not is_strong_password(data.password):
         raise APIException(400, "10010", "password is not strong")
-    if expired_account(db, email) is not None:
-        raise APIException(403, "10029", "account disabled: enrollment verification expired")
+    disabled = disabled_account(db, email)
+    if disabled is not None:
+        raise_disabled(disabled)
     # email 前綴是 9 碼數字才是學生，學號就是前綴；註冊後不能改 email，所以學號固定
     campus_id = student_id_of(email)
     new_account = Account(
