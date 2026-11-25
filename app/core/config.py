@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     window_seconds: int
     # 前後端同網域（nginx 轉發）時不需要；前端在其他網域才填，例如 ["https://app.example.com"]
     cors_origins: list[str] = []
+    # 前端網址：寄給校外人士的邀請信連結用，例如 https://sroi.example.com（結尾不要加 /）
+    frontend_base_url: str = "http://localhost:5173"
     admin_email: str | None = None
     admin_password: str | None = None
     admin_name: str = "管理員"

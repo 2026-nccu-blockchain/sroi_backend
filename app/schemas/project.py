@@ -185,6 +185,8 @@ class ProjectRead(ORMModel):
     # 送審時間；有值且還沒 published_at 表示審核中
     review_requested_at: Optional[datetime] = None
     published_at: Optional[datetime] = None
+    # 群組專案草稿：只有建立者看得到
+    is_draft: bool = False
     forms: list[LinkedFormRead] = Field(default_factory=list)
     stakeholders: list[StakeholderRead] = Field(default_factory=list)
     outcomes: list[OutcomeRead] = Field(default_factory=list)
@@ -192,6 +194,36 @@ class ProjectRead(ORMModel):
     interview_files: list[InterviewFileRead] = Field(default_factory=list)
     create_time: Optional[datetime]
     update_time: Optional[datetime]
+
+
+class AdminProjectListItem(BaseModel):
+    """管理員所有專案列表的一列；只帶列表用得到的欄位"""
+    project_id: str
+    owner_id: Optional[str]
+    group_id: Optional[str]
+    name: str
+    organization: str
+    begin: datetime
+    end: datetime
+    status: str
+    closed_at: Optional[datetime] = None
+    review_requested_at: Optional[datetime] = None
+    published_at: Optional[datetime] = None
+    creator_name: Optional[str] = None
+    group_title: Optional[str] = None
+    # 取代整包 forms，只為了顯示「已發布／草稿」
+    has_published_form: bool = False
+
+
+class AdminProjectPage(BaseModel):
+    items: list[AdminProjectListItem]
+    total: int
+    page: int
+    page_size: int
+    # {"all": n, "personal": n, "group": n}
+    scope_counts: dict[str, int]
+    # 目前 scope 底下各狀態的數量：{"all": n, "not_started": n, ...}
+    phase_counts: dict[str, int]
 
 
 class OutcomeValuationInput(BaseModel):

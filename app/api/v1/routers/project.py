@@ -12,6 +12,8 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, literal
 from sqlalchemy.orm import Session, selectinload, with_loader_criteria
+from sqlalchemy import and_, case, exists, func, or_
+from sqlalchemy.orm import Session, aliased, selectinload, with_loader_criteria
 from starlette.concurrency import run_in_threadpool
 
 from app.api.services.exchange_rates import get_exchange_rates, month_end_date
@@ -33,15 +35,20 @@ from app.core.permissions import (
     get_user_group_roles,
     has_role,
     can_review_database,
+    is_admin,
+    can_review_projects,
     is_project_reviewing,
     require_project_role,
 )
 from app.db.session import get_db
 from app.models.model import (
+    Account,
     Answer,
     Form,
     FormResponse,
     FinancialProxy,
+    FormStatus,
+    Group,
     GroupRole,
     Page,
     Project,
@@ -55,6 +62,8 @@ from app.models.model import (
     ResponseStatus,
 )
 from app.schemas.project import (
+    AdminProjectListItem,
+    AdminProjectPage,
     CostInput,
     OutcomeInput,
     ProjectCostsRead,
@@ -654,8 +663,17 @@ def list_projects(
     payload: dict = Depends(return_payload),
 ) -> list[Project]:
     user_id = _user_id(payload)
+    # 管理員看指定群組的專案時不限成員（管理員的群組頁）；權限仍是檢視者，由 get_project_role 決定；別人的草稿不顯示
+    visible = (
+        and_(
+            Project.group_id == group_id,
+            or_(Project.is_draft.is_(False), Project.created_by == user_id),
+        )
+        if group_id is not None and is_admin(db, user_id)
+        else accessible_project_filter(db, user_id)
+    )
     query = _project_query(db).filter(
-        accessible_project_filter(db, user_id),
+        visible,
         Project.is_delete.is_(False),
     )
     if scope == "personal":
@@ -668,8 +686,16 @@ def list_projects(
 
     group_roles = get_user_group_roles(db, user_id)
     for project in projects:
-        role = GroupRole.LEADER if project.is_personal else group_roles[project.group_id]
-        project.my_role = role.value
+        if project.is_personal:
+            role = GroupRole.LEADER
+        elif project.is_draft:
+            # 篩選條件保證草稿一定是自己建立的；建立者對自己的草稿視同組長
+            role = GroupRole.LEADER if project.group_id in group_roles else None
+        else:
+            role = group_roles.get(project.group_id)
+        # 只有管理員看非成員群組時會是 None
+        project.is_member = role is not None
+        project.my_role = (role or GroupRole.VIEWER).value
     return projects
 
 
@@ -733,6 +759,129 @@ def list_reviewing_projects(
     return projects
 
 
+PROJECT_PHASES = ("not_started", "in_progress", "pending_close", "closed", "reviewing", "published")
+
+
+def _phase_expr():
+    """和前端 getProjectPhase 相同的規則，改在資料庫算；時間用資料庫的 now()"""
+    now = func.now()
+    return case(
+        (Project.published_at.isnot(None), "published"),
+        (and_(Project.closed_at.isnot(None), Project.review_requested_at.isnot(None)), "reviewing"),
+        (Project.closed_at.isnot(None), "closed"),
+        (Project.begin > now, "not_started"),
+        (Project.end >= now, "in_progress"),
+        else_="pending_close",
+    )
+
+
+# 用 ! 當跳脫字元，不受資料庫 standard_conforming_strings 對反斜線的影響
+def _escape_like(keyword: str) -> str:
+    return keyword.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
+# 同樣要放在 /{project_id} 之前
+@router.get("/all", response_model=AdminProjectPage)
+def list_all_projects(
+    scope: Literal["all", "personal", "group"] = "all",
+    phase: Literal["all", "not_started", "in_progress", "pending_close", "closed", "reviewing", "published"] = "all",
+    q: str = Query(default="", max_length=100),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> dict:
+    """管理員：所有人的個人專案與所有群組專案；篩選、搜尋、計數、分頁都在資料庫做。"""
+    user_id = _user_id(payload)
+    if not is_admin(db, user_id):
+        raise APIException(403, "10008", "permission denied")
+
+    creator = aliased(Account)
+    phase_col = _phase_expr()
+    is_group = Project.group_id.isnot(None)
+    keyword = q.strip()
+
+    # 共用的 FROM + 基本條件：未刪除 + 搜尋（名稱、單位、建立者、群組名）
+    def base(*columns):
+        query = db.query(*columns).select_from(Project).outerjoin(
+            creator, creator.user_id == Project.created_by
+        ).outerjoin(
+            Group, Group.group_id == Project.group_id
+        ).filter(
+            Project.is_delete.is_(False),
+            # 群組草稿只有建立者看得到，管理員也看不到
+            or_(Project.is_draft.is_(False), Project.created_by == user_id),
+        )
+        if keyword:
+            pattern = f"%{_escape_like(keyword)}%"
+            query = query.filter(or_(
+                Project.name.ilike(pattern, escape="!"),
+                Project.organization.ilike(pattern, escape="!"),
+                creator.name.ilike(pattern, escape="!"),
+                Group.title.ilike(pattern, escape="!"),
+            ))
+        return query
+
+    # 一次拿到 (個人/群組) × 狀態 的數量，兩層分頁的數字都從這裡算
+    # 先包成子查詢再 GROUP BY，避免 CASE 裡的字串參數在 SELECT 和 GROUP BY 被當成不同運算式
+    counted = base(is_group.label("is_group"), phase_col.label("phase")).subquery()
+    scope_counts = {"all": 0, "personal": 0, "group": 0}
+    phase_counts = {key: 0 for key in ("all", *PROJECT_PHASES)}
+    for grouped, phase_value, count in db.query(
+        counted.c.is_group, counted.c.phase, func.count()
+    ).group_by(counted.c.is_group, counted.c.phase).all():
+        scope_key = "group" if grouped else "personal"
+        scope_counts["all"] += count
+        scope_counts[scope_key] += count
+        if scope in ("all", scope_key):
+            phase_counts["all"] += count
+            phase_counts[phase_value] += count
+
+    has_published_form = exists().where(
+        Form.project_id == Project.project_id,
+        Form.is_delete.is_(False),
+        Form.status == FormStatus.PUBLISHED,
+    )
+    items_query = base(
+        Project.project_id,
+        Project.owner_id,
+        Project.group_id,
+        Project.name,
+        Project.organization,
+        Project.begin,
+        Project.end,
+        Project.status,
+        Project.closed_at,
+        Project.review_requested_at,
+        Project.published_at,
+        creator.name.label("creator_name"),
+        Group.title.label("group_title"),
+        has_published_form.label("has_published_form"),
+    )
+    if scope == "personal":
+        items_query = items_query.filter(Project.group_id.is_(None))
+    elif scope == "group":
+        items_query = items_query.filter(Project.group_id.isnot(None))
+    if phase != "all":
+        items_query = items_query.filter(phase_col == phase)
+
+    rows = items_query.order_by(
+        Project.update_time.desc().nullslast(),
+        Project.create_time.desc(),
+        # 排序要穩定，翻頁才不會重複或漏掉
+        Project.project_id,
+    ).offset((page - 1) * page_size).limit(page_size).all()
+
+    return {
+        "items": [AdminProjectListItem.model_validate(dict(row._mapping)) for row in rows],
+        "total": phase_counts[phase],
+        "page": page,
+        "page_size": page_size,
+        "scope_counts": scope_counts,
+        "phase_counts": phase_counts,
+    }
+
+
 @router.post("", response_model=ProjectRead, status_code=status.HTTP_201_CREATED)
 def create_project(
     data: ProjectCreate,
@@ -754,6 +903,8 @@ def create_project(
         begin=data.begin,
         end=data.end,
         status=data.status,
+        # 群組專案建立後先是草稿，只有建立者看得到
+        is_draft=data.group_id is not None,
     )
     saved_stakeholders = _replace_stakeholders(project, data.stakeholders)
     _, costs_sent = _apply_stakeholder_children(project, data.stakeholders, saved_stakeholders)
@@ -996,6 +1147,25 @@ def delete_project(
     db.commit()
 
 
+@router.post("/{project_id}/make-public", response_model=ProjectRead)
+def make_project_public(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """群組草稿公開給組員：草稿只有建立者看得到，所以只有建立者能做；公開後不能改回草稿。"""
+    user_id = _user_id(payload)
+    # 別人的草稿在 get_project_role 會是 None，這裡直接回 404
+    project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
+    if project.is_personal:
+        raise APIException(400, "30022", "個人專案沒有草稿模式")
+    if not project.is_draft:
+        raise APIException(409, "30023", "專案已經公開")
+    project.is_draft = False
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
+
+
 @router.post("/{project_id}/close", response_model=ProjectRead)
 def close_project(
     project_id: str,
@@ -1007,6 +1177,8 @@ def close_project(
     project = _get_project(db, project_id, user_id, GroupRole.LEADER, allow_closed=True)
     if project.closed_at is not None:
         raise APIException(409, "30014", "專案已結案")
+    if project.is_draft:
+        raise APIException(409, "30021", "草稿需要先公開給群組才能結案")
     if datetime.now(timezone.utc) <= _as_aware(project.end):
         raise APIException(400, "30015", "專案期間尚未結束，還不能結案")
     project.closed_at = datetime.now(timezone.utc)
