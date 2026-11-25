@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
+from app.api.services.form_drafts import new_form_consent
 from app.core.deps import return_payload
 from app.core.exceptions import APIException
 from app.core.permissions import accessible_project_filter, require_form_role, require_project_role
@@ -23,6 +24,7 @@ from app.models.model import (
     Page,
     Project,
     ProjectOutcome,
+    ProjectStakeholder,
     Question,
     QuestionOption,
     QuestionType,
@@ -83,6 +85,7 @@ def _validate_project_outcome(
     outcome_id: str | None,
     user_id: str,
     project_id: str | None = None,
+    stakeholder_id: str | None = None,
 ) -> None:
     if outcome_id is None:
         return
@@ -93,6 +96,8 @@ def _validate_project_outcome(
     )
     if project_id is not None:
         query = query.filter(ProjectOutcome.project_id == project_id)
+    if stakeholder_id is not None:
+        query = query.filter(ProjectOutcome.stakeholder_id == stakeholder_id)
     project = query.first()
     if project is None:
         raise APIException(400, "30003", "Project outcome does not belong to this user")
@@ -186,35 +191,6 @@ def _ensure_public_token(form: Form) -> None:
         form.public_token = secrets.token_urlsafe(18)
 
 
-DEFAULT_CONSENT = {
-    "title": "USR計畫參與同意書與資料授權書",
-    "organization_name": "政治大學「多元共容・文山共好」USR計畫團隊",
-    "content": (
-        "您好，我們需要您參與本問卷調查之資料，作為檔案紀錄，並授權給計畫辦公室與計畫主持人"
-        "製作計畫成果報告書，以及作為教育目的之簡報與研究成果。參與完全出於自願，您可以選擇不參與。"
-    ),
-    "secondary_use_description": (
-        "若有非本計畫之老師、助理或學生欲將本課程、活動或工作坊所產生的資料作為教學或研究使用，"
-        "計畫辦公室將審核其研究計畫，僅在能保護個人隱私並與計畫維持互惠關係時提供去識別化資料。"
-    ),
-    "withdrawal_method": "如欲撤回同意，請透過下方聯絡方式與計畫辦公室聯繫。",
-    "contact_name": "政大「多元共容・文山共好」USR計畫辦公室",
-    "contact_email": "nccuusr@gmail.com",
-    "contact_phone": "02-29393091 分機 51479",
-    "requires_guardian": True,
-    "secondary_use_enabled": True,
-}
-
-
-def _new_consent(*, version: int = 0, is_published: bool = False) -> FormConsent:
-    return FormConsent(
-        version=version,
-        is_published=is_published,
-        published_at=datetime.now(timezone.utc) if is_published else None,
-        **DEFAULT_CONSENT,
-    )
-
-
 def _validate_consent_for_publish(consent: FormConsent | None) -> None:
     if consent is None:
         raise APIException(400, "20036", "Informed consent is required before publishing")
@@ -302,7 +278,7 @@ def create_form(
         status=data.status,
         shuffle_outcome_questions=data.shuffle_outcome_questions,
     )
-    form.consent_versions.append(_new_consent())
+    form.consent_versions.append(new_form_consent())
     if data.status == FormStatus.PUBLISHED:
         _ensure_public_token(form)
     if sum(page.is_respondent_info for page in data.pages) > 1:
@@ -382,7 +358,7 @@ def update_form_consent(
         FormConsent.is_delete.is_(False),
     ).first()
     if consent is None:
-        consent = _new_consent()
+        consent = new_form_consent()
         form.consent_versions.append(consent)
     for field, value in data.model_dump().items():
         setattr(consent, field, value)
@@ -402,10 +378,13 @@ def sync_project_outcomes(
     if form.project_id is None:
         raise APIException(400, "20035", "Form is not linked to a project")
 
-    pending_outcomes = db.query(ProjectOutcome).filter(
+    pending_query = db.query(ProjectOutcome).filter(
         ProjectOutcome.project_id == form.project_id,
         ProjectOutcome.sync_index > form.outcome_sync_index,
-    ).order_by(ProjectOutcome.sync_index).all()
+    )
+    if form.stakeholder_id is not None:
+        pending_query = pending_query.filter(ProjectOutcome.stakeholder_id == form.stakeholder_id)
+    pending_outcomes = pending_query.order_by(ProjectOutcome.sync_index).all()
     if not pending_outcomes:
         return _form_query(db).filter(Form.form_id == form_id).one()
 
@@ -539,6 +518,10 @@ def delete_form(
     payload: dict = Depends(return_payload),
 ) -> None:
     form = _get_form(db, form_id, _user_id(payload))
+    if form.stakeholder_id is not None and db.query(ProjectStakeholder.stakeholder_id).filter(
+        ProjectStakeholder.stakeholder_id == form.stakeholder_id, ProjectStakeholder.is_delete.is_(False)
+    ).first():
+        raise APIException(409, "20043", "仍在使用的利害關係人專屬表單無法刪除")
     form.is_delete = True
     db.commit()
 
@@ -562,7 +545,7 @@ def create_page(
             raise APIException(400, "20033", "A form can only have one respondent information block")
         if data.project_outcome_id is not None:
             raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
-    _validate_project_outcome(db, data.project_outcome_id, user_id, form.project_id)
+    _validate_project_outcome(db, data.project_outcome_id, user_id, form.project_id, form.stakeholder_id)
     page = Page(
         form=form,
         project_outcome_id=data.project_outcome_id,
@@ -608,7 +591,9 @@ def update_page(
         if changes.get("project_outcome_id", page.project_outcome_id) is not None:
             raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
     if "project_outcome_id" in changes:
-        _validate_project_outcome(db, changes["project_outcome_id"], user_id, page.form.project_id)
+        _validate_project_outcome(
+            db, changes["project_outcome_id"], user_id, page.form.project_id, page.form.stakeholder_id,
+        )
     for field, value in changes.items():
         setattr(page, field, value)
     db.commit()
@@ -764,6 +749,7 @@ def _serialize_response(response: FormResponse) -> FormResponseRead:
         form_id=response.form_id,
         respondent_email=response.respondent_email,
         status=response.status,
+        is_duplicate_legacy=response.is_duplicate_legacy,
         started_at=response.started_at,
         submitted_at=response.submitted_at,
         consent=ConsentRecordRead.model_validate(response.consent_record)

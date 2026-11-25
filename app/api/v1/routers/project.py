@@ -1,6 +1,8 @@
 import io
 import shutil
-from datetime import datetime, timezone
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Literal, Optional
@@ -8,9 +10,12 @@ from zipfile import BadZipFile, ZipFile
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import FileResponse
+from sqlalchemy import func, literal
 from sqlalchemy.orm import Session, selectinload, with_loader_criteria
 from starlette.concurrency import run_in_threadpool
 
+from app.api.services.exchange_rates import get_exchange_rates, month_end_date
+from app.api.services.form_drafts import add_stakeholder_form
 from app.api.services.interview_files import (
     INTERVIEW_UPLOAD_DIR,
     discard_temp_interview_file,
@@ -27,7 +32,7 @@ from app.core.permissions import (
     get_member_project_role,
     get_user_group_roles,
     has_role,
-    can_review_projects,
+    can_review_database,
     is_project_reviewing,
     require_project_role,
 )
@@ -56,6 +61,7 @@ from app.schemas.project import (
     ProjectCreate,
     ProjectRead,
     ProjectReviewDecision,
+    ProjectSROIRead,
     StakeholderSROIRead,
     StakeholderSROIUpdate,
     ProjectUpdate,
@@ -71,7 +77,6 @@ READ_CHUNK_SIZE = 1024 * 1024
 NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "begin", "end", "status"}
 MONEY_QUANTUM = Decimal("0.01")
 RATIO_QUANTUM = Decimal("0.0001")
-OUTCOME_ELIGIBILITY_THRESHOLD = Decimal("0.5")
 
 
 def _user_id(payload: dict) -> str:
@@ -131,13 +136,9 @@ def _outcome_value(
     displacement_rate: Decimal,
     duration_years: int,
     dropoff_rate: Decimal,
-    discount_rate: Decimal,
-    is_included: bool,
 ) -> Decimal:
-    if not is_included:
-        return Decimal("0")
     one = Decimal("1")
-    base = (
+    annual_value = (
         quantity
         * financial_proxy_value
         * (one - deadweight_rate)
@@ -145,9 +146,18 @@ def _outcome_value(
         * (one - displacement_rate)
     )
     total = Decimal("0")
-    for year in range(duration_years):
-        total += base * ((one - dropoff_rate) ** year) / ((one + discount_rate) ** year)
+    for _ in range(duration_years):
+        total += annual_value
+        annual_value *= one - dropoff_rate
     return total.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+@dataclass
+class OutcomeScaleMetric:
+    highest_score: Decimal = Decimal("0")
+    answer_count: int = 0
+    passing_question_count: int = 0
+    respondent_count: int = 0
 
 
 def _outcome_scale_metrics(
@@ -155,14 +165,18 @@ def _outcome_scale_metrics(
     project_id: str,
     outcome_ids: set[str],
     form_ids: set[str] | None = None,
-) -> dict[str, tuple[float, int]]:
-    if not outcome_ids:
+) -> dict[str, OutcomeScaleMetric]:
+    if not outcome_ids or (form_ids is not None and not form_ids):
         return {}
+    email = func.nullif(func.lower(func.trim(FormResponse.respondent_email)), "")
+    respondent_key = func.coalesce(literal("email:") + email, literal("response:") + FormResponse.response_id)
     query = db.query(
-        Page.project_outcome_id,
-        Answer.number_value,
+        Page.project_outcome_id.label("outcome_id"),
+        Question.question_id,
         Question.scale_begin,
         Question.scale_end,
+        Answer.number_value,
+        respondent_key.label("respondent_key"),
     ).join(
         Form,
         Form.form_id == Page.form_id,
@@ -183,30 +197,41 @@ def _outcome_scale_metrics(
         Question.question_type == QuestionType.SC,
         Question.is_temp.is_(False),
         Question.is_delete.is_(False),
-        Answer.number_value.is_not(None),
+        Question.scale_end > Question.scale_begin,
+        Answer.number_value.between(Question.scale_begin, Question.scale_end),
         Answer.is_delete.is_(False),
+        FormResponse.form_id == Form.form_id,
         FormResponse.status == ResponseStatus.SUBMITTED,
         FormResponse.is_duplicate_legacy.is_(False),
         FormResponse.is_delete.is_(False),
     )
     if form_ids is not None:
-        if not form_ids:
-            return {}
         query = query.filter(Form.form_id.in_(form_ids))
-    rows = query.all()
+    valid_answers = query.cte("valid_scale_answers")
+    answers = valid_answers.c
+    respondents = db.query(
+        answers.outcome_id,
+        func.count(answers.respondent_key.distinct()).label("respondent_count"),
+    ).group_by(answers.outcome_id).subquery("outcome_respondents")
+    rows = db.query(
+        answers.outcome_id, answers.question_id, answers.scale_begin, answers.scale_end,
+        func.sum(answers.number_value), func.count(), respondents.c.respondent_count,
+    ).select_from(valid_answers).join(
+        respondents, respondents.c.outcome_id == answers.outcome_id,
+    ).group_by(
+        answers.outcome_id, answers.question_id, answers.scale_begin, answers.scale_end,
+        respondents.c.respondent_count,
+    ).all()
 
-    scores: dict[str, list[Decimal]] = {outcome_id: [] for outcome_id in outcome_ids}
-    for outcome_id, number_value, scale_begin, scale_end in rows:
-        if outcome_id is None or scale_begin is None or scale_end is None or scale_end <= scale_begin:
-            continue
-        normalized = (Decimal(number_value) - Decimal(scale_begin)) / Decimal(scale_end - scale_begin)
-        scores[outcome_id].append(max(Decimal("0"), min(Decimal("1"), normalized)))
-
-    return {
-        outcome_id: (float(sum(values, Decimal("0")) / len(values)), len(values))
-        for outcome_id, values in scores.items()
-        if values
-    }
+    metrics: dict[str, OutcomeScaleMetric] = {}
+    for outcome_id, _, begin, end, score_sum, count, respondent_count in rows:
+        metric = metrics.setdefault(outcome_id, OutcomeScaleMetric(respondent_count=respondent_count))
+        normalized = Decimal(score_sum - begin * count) / ((end - begin) * count)
+        metric.highest_score = max(metric.highest_score, normalized)
+        metric.answer_count += count
+        if 2 * score_sum >= (begin + end) * count:
+            metric.passing_question_count += 1
+    return metrics
 
 
 def _active_stakeholders(project: Project) -> list[ProjectStakeholder]:
@@ -266,7 +291,9 @@ def _serialize_stakeholder_sroi(
     outcome_ids = {outcome.outcome_id for outcome in stakeholder_outcomes}
     valuations = {
         valuation.outcome_id: valuation
-        for valuation in db.query(ProjectOutcomeValuation).filter(
+        for valuation in db.query(ProjectOutcomeValuation).options(
+            selectinload(ProjectOutcomeValuation.financial_proxy),
+        ).filter(
             ProjectOutcomeValuation.project_id == project.project_id,
             ProjectOutcomeValuation.stakeholder_id == stakeholder.stakeholder_id,
             ProjectOutcomeValuation.outcome_id.in_(outcome_ids) if outcome_ids else False,
@@ -281,10 +308,13 @@ def _serialize_stakeholder_sroi(
         ),
         Decimal("0"),
     ).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
-    discount_rate = _decimal(stakeholder.sroi_discount_rate, "0.035")
     linked_form_ids = {
         form_id for form_id in (stakeholder.pre_form_id, stakeholder.post_form_id) if form_id
     }
+    linked_form_ids.update(
+        form.form_id for form in project.forms
+        if form.stakeholder_id == stakeholder.stakeholder_id and not form.is_delete
+    )
     scale_metrics = _outcome_scale_metrics(
         db,
         project.project_id,
@@ -294,37 +324,58 @@ def _serialize_stakeholder_sroi(
     serialized_outcomes: list[dict] = []
     total_social_value = Decimal("0")
     has_missing_proxy = False
+    has_missing_exchange_rate = False
+    has_eligible_outcome = False
+    currencies_by_date: dict[date | None, set[str]] = defaultdict(set)
+    proxies_by_outcome: dict[str, FinancialProxy] = {}
+    dates_by_outcome: dict[str, date | None] = {}
+    for outcome_id, valuation in valuations.items():
+        proxy = valuation.financial_proxy
+        if proxy is None or proxy.is_delete or proxy.review_status != "approved":
+            continue
+        rate_date = month_end_date(valuation.exchange_rate_month)
+        currencies_by_date[rate_date].add(proxy.currency)
+        proxies_by_outcome[outcome_id] = proxy
+        dates_by_outcome[outcome_id] = rate_date
+    rates_by_date = {
+        rate_date: get_exchange_rates(currencies, rate_date)
+        for rate_date, currencies in currencies_by_date.items()
+    }
 
     for outcome in stakeholder_outcomes:
         valuation = valuations.get(outcome.outcome_id)
-        proxy = valuation.financial_proxy if valuation else None
-        if proxy is not None and proxy.is_delete:
-            proxy = None
-        quantity = _decimal(valuation.quantity if valuation else None)
-        financial_proxy_value = _decimal(proxy.value if proxy else None)
+        proxy = proxies_by_outcome.get(outcome.outcome_id)
+        exchange = rates_by_date[dates_by_outcome[outcome.outcome_id]].get(proxy.currency) if proxy else None
+        financial_proxy_value = proxy.value * exchange.rate_to_twd if proxy and exchange else None
         deadweight_rate = _decimal(valuation.deadweight_rate if valuation else None)
         attribution_rate = _decimal(valuation.attribution_rate if valuation else None)
         displacement_rate = _decimal(valuation.displacement_rate if valuation else None)
         duration_years = valuation.duration_years if valuation else 1
         dropoff_rate = _decimal(valuation.dropoff_rate if valuation else None)
-        is_included = valuation.is_included if valuation else True
-        calculated_value = _outcome_value(
-            quantity=quantity,
-            financial_proxy_value=financial_proxy_value,
-            deadweight_rate=deadweight_rate,
-            attribution_rate=attribution_rate,
-            displacement_rate=displacement_rate,
-            duration_years=duration_years,
-            dropoff_rate=dropoff_rate,
-            discount_rate=discount_rate,
-            is_included=is_included,
-        )
-        total_social_value += calculated_value
+        metric = scale_metrics.get(outcome.outcome_id)
+        passing_count = metric.passing_question_count if metric else 0
+        is_included = passing_count > 0
+        quantity = Decimal(metric.respondent_count) if metric and is_included else Decimal("0")
+        has_eligible_outcome = has_eligible_outcome or is_included
+        calculated_value = None
+        if not is_included:
+            calculated_value = Decimal("0")
+        elif financial_proxy_value is not None:
+            calculated_value = _outcome_value(
+                quantity=quantity,
+                financial_proxy_value=financial_proxy_value,
+                deadweight_rate=deadweight_rate,
+                attribution_rate=attribution_rate,
+                displacement_rate=displacement_rate,
+                duration_years=duration_years,
+                dropoff_rate=dropoff_rate,
+            )
+        if calculated_value is not None:
+            total_social_value += calculated_value
         if is_included and proxy is None:
             has_missing_proxy = True
-        metric = scale_metrics.get(outcome.outcome_id)
-        scale_score = metric[0] if metric else None
-        answer_count = metric[1] if metric else 0
+        if is_included and proxy is not None and exchange is None:
+            has_missing_exchange_rate = True
         serialized_outcomes.append({
             "outcome_id": outcome.outcome_id,
             "outcome_name": outcome.name,
@@ -334,21 +385,27 @@ def _serialize_stakeholder_sroi(
             "financial_proxy_name": proxy.name if proxy else None,
             "financial_proxy_note": proxy.note if proxy else None,
             "financial_proxy_value": financial_proxy_value,
+            "financial_proxy_amount": proxy.value if proxy else None,
+            "financial_proxy_currency": proxy.currency if proxy else None,
+            "exchange_rate_month": valuation.exchange_rate_month if valuation else None,
+            "exchange_rate": exchange.rate_to_twd if exchange else None,
+            "exchange_rate_date": exchange.date if exchange else None,
             "deadweight_rate": deadweight_rate,
             "attribution_rate": attribution_rate,
             "displacement_rate": displacement_rate,
             "duration_years": duration_years,
             "dropoff_rate": dropoff_rate,
             "is_included": is_included,
-            "scale_score": scale_score,
-            "scale_answer_count": answer_count,
-            "suggested_eligible": scale_score > float(OUTCOME_ELIGIBILITY_THRESHOLD) if scale_score is not None else None,
+            "scale_score": float(metric.highest_score) if metric else None,
+            "scale_answer_count": metric.answer_count if metric else 0,
+            "scale_passing_question_count": passing_count,
+            "suggested_eligible": is_included if metric else None,
             "calculated_value": calculated_value,
         })
 
     total_social_value = total_social_value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
     sroi_ratio = None
-    if input_cost > 0 and not has_missing_proxy:
+    if has_eligible_outcome and input_cost > 0 and not has_missing_proxy and not has_missing_exchange_rate:
         sroi_ratio = (total_social_value / input_cost).quantize(
             RATIO_QUANTUM,
             rounding=ROUND_HALF_UP,
@@ -361,9 +418,8 @@ def _serialize_stakeholder_sroi(
         "stakeholder_role": stakeholder.stakeholder_type,
         "position": stakeholder.position,
         "input_cost": input_cost,
-        "discount_rate": discount_rate,
         "outcomes": serialized_outcomes,
-        "total_social_value": total_social_value,
+        "total_social_value": None if has_missing_exchange_rate else total_social_value,
         "sroi_ratio": sroi_ratio,
     }
 
@@ -385,16 +441,20 @@ def _validate_stakeholder_forms(
         return
     if project_id is None:
         raise APIException(400, "30002", "Linked form does not belong to this project")
-    valid_ids = {
-        form_id
-        for (form_id,) in db.query(Form.form_id).filter(
+    owners = {
+        form_id: stakeholder_id
+        for form_id, stakeholder_id in db.query(Form.form_id, Form.stakeholder_id).filter(
             Form.form_id.in_(form_ids),
             Form.project_id == project_id,
             Form.is_delete.is_(False),
         ).all()
     }
-    if valid_ids != form_ids:
+    if set(owners) != form_ids:
         raise APIException(400, "30002", "Linked form does not belong to this project")
+    for item in items:
+        for form_id in (item.pre_form_id, item.post_form_id):
+            if form_id and owners[form_id] not in (None, item.stakeholder_id):
+                raise APIException(400, "30002", "只能指定專案共用表單或這位利害關係人的專屬表單")
 
 
 def _as_aware(value: datetime) -> datetime:
@@ -641,7 +701,7 @@ def list_published_projects(
 
 
 def _require_reviewer(db: Session, user_id: str) -> None:
-    if not can_review_projects(db, user_id):
+    if not can_review_database(db, user_id):
         raise APIException(403, "30019", "只有資料庫編輯者或管理員能審核專案")
 
 
@@ -699,6 +759,8 @@ def create_project(
     _, costs_sent = _apply_stakeholder_children(project, data.stakeholders, saved_stakeholders)
     db.add(project)
     db.flush()
+    for stakeholder in saved_stakeholders:
+        add_stakeholder_form(project, stakeholder, user_id)
     if costs_sent:
         _sync_actual_input_cost(db, project)
     db.commit()
@@ -712,6 +774,46 @@ def get_project(
     payload: dict = Depends(return_payload),
 ) -> Project:
     return _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
+
+
+@router.get(
+    "/{project_id}/sroi",
+    response_model=ProjectSROIRead,
+)
+def get_project_sroi(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> ProjectSROIRead:
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
+    input_cost = _decimal(project.actual_input_cost)
+    total_social_value = Decimal("0")
+    included_count = 0
+    missing_proxy_count = 0
+    missing_exchange_rate_count = 0
+    for stakeholder in _active_stakeholders(project):
+        result = _serialize_stakeholder_sroi(db, project, stakeholder)
+        for outcome in result["outcomes"]:
+            if not outcome["is_included"]:
+                continue
+            included_count += 1
+            if outcome["calculated_value"] is not None:
+                total_social_value += outcome["calculated_value"]
+            elif outcome["financial_proxy_id"] is None:
+                missing_proxy_count += 1
+            else:
+                missing_exchange_rate_count += 1
+
+    complete = included_count > 0 and not (missing_proxy_count or missing_exchange_rate_count)
+    return ProjectSROIRead(
+        input_cost=input_cost,
+        total_social_value=total_social_value if complete else None,
+        sroi_ratio=(total_social_value / input_cost).quantize(RATIO_QUANTUM, rounding=ROUND_HALF_UP)
+        if complete and input_cost > 0 else None,
+        included_outcome_count=included_count,
+        missing_proxy_count=missing_proxy_count,
+        missing_exchange_rate_count=missing_exchange_rate_count,
+    )
 
 
 @router.get(
@@ -760,12 +862,13 @@ def save_stakeholder_sroi(
         for proxy in db.query(FinancialProxy).filter(
             FinancialProxy.proxy_id.in_(proxy_ids) if proxy_ids else False,
             FinancialProxy.is_delete.is_(False),
+            FinancialProxy.review_status == "approved",
         ).all()
     }
     if set(proxies) != proxy_ids:
-        raise APIException(400, "30013", "財務代理變數不存在或已刪除")
-
-    stakeholder.sroi_discount_rate = data.discount_rate
+        raise APIException(400, "30013", "只能選擇已通過審核的財務代理變數")
+    for month in {item.exchange_rate_month for item in data.outcomes if item.exchange_rate_month is not None}:
+        month_end_date(month)
 
     existing_valuations = {
         valuation.outcome_id: valuation
@@ -786,16 +889,16 @@ def save_stakeholder_sroi(
             db.add(valuation)
             db.flush()
         proxy = proxies.get(item.financial_proxy_id)
-        valuation.quantity = item.quantity
         valuation.financial_proxy_id = item.financial_proxy_id
-        # 保留一份儲存當下的金額快照；讀取計算時以代理變數資料庫的現值為準。
+        if "exchange_rate_month" in item.model_fields_set:
+            valuation.exchange_rate_month = item.exchange_rate_month
+        # 保留儲存時的原幣金額；計算時以代理變數現值及最新匯率換算。
         valuation.financial_proxy_value = proxy.value if proxy else Decimal("0")
         valuation.deadweight_rate = item.deadweight_rate
         valuation.attribution_rate = item.attribution_rate
         valuation.displacement_rate = item.displacement_rate
         valuation.duration_years = item.duration_years
         valuation.dropoff_rate = item.dropoff_rate
-        valuation.is_included = item.is_included
         valuation.is_delete = False
         retained_valuation_ids.add(valuation.valuation_id)
     for valuation in existing_valuations.values():
@@ -845,10 +948,13 @@ def update_project(
         stakeholder_items = [StakeholderUpdateInput(**item) for item in stakeholders]
         _validate_stakeholder_forms(db, stakeholder_items, project_id)
         saved_stakeholders = _replace_stakeholders(project, stakeholder_items)
+        new_stakeholders = [item for item in saved_stakeholders if item.stakeholder_id is None]
         promotions = _apply_interview_files(db, project, stakeholder_items, saved_stakeholders)
         _apply_stakeholder_children(project, stakeholder_items, saved_stakeholders)
         # 移除利害關係人也會刪掉他的成果與成本，所以只要送了利害關係人就重新整理
         db.flush()
+        for stakeholder in new_stakeholders:
+            add_stakeholder_form(project, stakeholder, user_id)
         _sync_actual_input_cost(db, project)
     db.flush()
 
