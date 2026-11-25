@@ -262,6 +262,7 @@ class FormResponseRead(ORMModel):
     form_id: str
     respondent_email: Optional[str]
     status: ResponseStatus
+    is_duplicate_legacy: bool
     started_at: datetime
     submitted_at: Optional[datetime]
     answers: list[AnswerRead] = Field(default_factory=list)

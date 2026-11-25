@@ -202,11 +202,20 @@ class GroupAccount(Base):
 
 class Form(Base):
     __tablename__ = "forms"
+    __table_args__ = (
+        Index(
+            "uq_forms_active_stakeholder", "stakeholder_id", unique=True,
+            postgresql_where=text("stakeholder_id IS NOT NULL AND is_delete = false"),
+        ),
+    )
 
     form_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     public_token = Column(String(32), unique=True, index=True)
     author_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False)
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=True, index=True)
+    stakeholder_id = Column(String(36), ForeignKey(
+        "project_stakeholders.stakeholder_id", ondelete="SET NULL", name="fk_forms_stakeholder_id"
+    ), nullable=True)
     title = Column(String(255))
     content = Column(Text)
     status = Column(SQLEnum(FormStatus), nullable=False, default=FormStatus.DRAFT)
@@ -417,6 +426,8 @@ class ProjectStakeholder(Base):
     pre_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 前測表單
     post_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 後測表單
     sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
+    # 舊的整份 SROI 匯率年月，保留原始設定供資料遷移。
+    sroi_exchange_rate_month = Column(String(7), nullable=True)
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -492,7 +503,8 @@ class ProjectOutcomeValuation(Base):
         index=True,
     )
     quantity = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
-    financial_proxy_value = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
+    financial_proxy_value = Column(Numeric(18, 4), nullable=False, default=0, server_default="0")
+    exchange_rate_month = Column(String(7), nullable=True)
     deadweight_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
     attribution_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
     displacement_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
@@ -731,6 +743,12 @@ class AnswerChoice(Base):
 
 class FinancialProxy(Base):
     __tablename__ = "financial_proxies"
+    __table_args__ = (
+        CheckConstraint(
+            "review_status IN ('pending', 'approved', 'rejected')",
+            name="ck_financial_proxy_review_status",
+        ),
+    )
 
     proxy_id = Column(
         String(36),
@@ -740,8 +758,12 @@ class FinancialProxy(Base):
 
     name = Column(String(255), nullable=False)
     value = Column(Numeric(18, 4), nullable=False)
+    currency = Column(String(3), nullable=False, default="TWD", server_default="TWD")
     unit = Column(String(50), nullable=False, default="元", server_default="元")
     note = Column(Text, nullable=False, default="")
+    review_status = Column(String(10), nullable=False, default="pending", server_default="pending")
+    reviewed_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
 
     created_by = Column(
         String(36),

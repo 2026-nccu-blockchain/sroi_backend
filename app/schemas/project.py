@@ -1,10 +1,11 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.model import FormStatus, GroupRole
+from app.schemas.financial_proxy import ExchangeRateMonth
 
 
 DEFAULT_PROJECT_NAME = "未命名的專案"
@@ -100,6 +101,7 @@ class TempInterviewFileRead(BaseModel):
 
 class LinkedFormRead(ORMModel):
     form_id: str
+    stakeholder_id: Optional[str]
     title: Optional[str]
     status: FormStatus
 
@@ -226,18 +228,16 @@ class AdminProjectPage(BaseModel):
 
 class OutcomeValuationInput(BaseModel):
     outcome_id: str
-    quantity: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
     financial_proxy_id: Optional[str] = None
+    exchange_rate_month: ExchangeRateMonth | None = None
     deadweight_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
     attribution_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
     displacement_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
     duration_years: int = Field(default=1, ge=1, le=20)
     dropoff_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
-    is_included: bool = True
 
 
 class StakeholderSROIUpdate(BaseModel):
-    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
     outcomes: list[OutcomeValuationInput] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -256,7 +256,12 @@ class OutcomeValuationRead(BaseModel):
     financial_proxy_id: Optional[str]
     financial_proxy_name: Optional[str]
     financial_proxy_note: Optional[str]
-    financial_proxy_value: Decimal
+    financial_proxy_value: Decimal | None
+    financial_proxy_amount: Decimal | None
+    financial_proxy_currency: str | None
+    exchange_rate_month: ExchangeRateMonth | None
+    exchange_rate: Decimal | None
+    exchange_rate_date: date | None
     deadweight_rate: Decimal
     attribution_rate: Decimal
     displacement_rate: Decimal
@@ -265,8 +270,9 @@ class OutcomeValuationRead(BaseModel):
     is_included: bool
     scale_score: Optional[float]
     scale_answer_count: int
+    scale_passing_question_count: int
     suggested_eligible: Optional[bool]
-    calculated_value: Decimal
+    calculated_value: Decimal | None
 
 
 class StakeholderSROIRead(BaseModel):
@@ -277,10 +283,19 @@ class StakeholderSROIRead(BaseModel):
     stakeholder_role: str
     position: int
     input_cost: Decimal
-    discount_rate: Decimal
+    discount_rate: Decimal = Decimal("0")  # Older clients still read this field.
     outcomes: list[OutcomeValuationRead]
-    total_social_value: Decimal
+    total_social_value: Decimal | None
     sroi_ratio: Optional[Decimal]
+
+
+class ProjectSROIRead(BaseModel):
+    input_cost: Decimal
+    total_social_value: Decimal | None
+    sroi_ratio: Decimal | None
+    included_outcome_count: int
+    missing_proxy_count: int
+    missing_exchange_rate_count: int
 
 
 class ProjectReviewDecision(BaseModel):

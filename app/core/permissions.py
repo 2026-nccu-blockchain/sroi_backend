@@ -71,8 +71,8 @@ def get_member_project_role(db: Session, project: Project, user_id: str) -> Grou
     return role
 
 
-def can_review_projects(db: Session, user_id: str) -> bool:
-    """資料庫編輯者與管理員能審核專案"""
+def can_review_database(db: Session, user_id: str) -> bool:
+    """資料庫編輯者與管理員能審核資料庫提案。"""
     return db.query(Account).filter(
         Account.user_id == user_id,
         Account.role.in_([Role.DB_EDITOR, Role.ADMIN]),
@@ -101,7 +101,7 @@ def get_project_role(db: Session, project: Project, user_id: str) -> GroupRole |
     if project.published_at is not None:
         return GroupRole.VIEWER
     # 審核中的專案讓資料庫編輯者、管理員以檢視者身分查看；審核中一定已結案
-    if is_project_reviewing(project) and can_review_projects(db, user_id):
+    if is_project_reviewing(project) and can_review_database(db, user_id):
         return GroupRole.VIEWER
     # 管理員可以檢視所有專案（所有專案頁）；群組草稿除外，只給檢視者，不能修改
     if is_admin(db, user_id) and not project.is_draft:
