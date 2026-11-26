@@ -157,7 +157,6 @@ def create_proxy(
         name=data.name,
         value=data.value,
         currency=data.currency,
-        unit=data.unit,
         note=data.note,
         review_status="pending",
     )
@@ -181,7 +180,6 @@ def update_proxy(
     item.value = data.value
     if "currency" in data.model_fields_set:
         item.currency = data.currency
-    item.unit = data.unit
     item.note = data.note
     item.review_status = "pending"
     item.reviewed_by = None
