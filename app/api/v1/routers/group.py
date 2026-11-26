@@ -7,7 +7,7 @@ from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
-from app.core.permissions import count_group_leaders, get_group_members
+from app.core.permissions import count_group_leaders, get_group_members, is_admin
 from app.schemas.group import (
     InviteRequest,
     ChangeRoleRequest,
@@ -41,7 +41,8 @@ def invite_group(request: Request, GroupId: str, data: InviteRequest, db: Sessio
         raise APIException(404, "10001", "user not found")
     group_leader = db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == user_id, 
                                                  GroupAccount.group_role == GroupRole.LEADER, GroupAccount.is_delete == False).first()
-    if group_leader is None:
+    # 組長或管理員可以新增成員
+    if group_leader is None and user.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
     if db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == invited_user.user_id,
                                       GroupAccount.is_delete == False).first() is not None:
@@ -77,9 +78,10 @@ def change_permission(request: Request, GroupId: str, data: ChangeRoleRequest, d
         raise APIException(404, "10001", "user not found")
     group_leader = db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.user_id == user_id, 
                                                  GroupAccount.group_role == GroupRole.LEADER, GroupAccount.is_delete == False).first()
-    if group_leader is None:
+    # 組長或管理員可以變更成員權限；管理員不需要是群組成員
+    if group_leader is None and user.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
-    if group_leader.user_id == change_user.user_id:
+    if user_id == change_user.user_id:
         raise APIException(400, "10015", "can't change own permissions")
     change = db.query(GroupAccount).filter(GroupAccount.user_id == data.user_id, GroupAccount.group_id == GroupId, GroupAccount.is_delete == False).first()
     if change is None:
@@ -89,6 +91,9 @@ def change_permission(request: Request, GroupId: str, data: ChangeRoleRequest, d
         raise APIException(400, "10022", "group_role is required")
     if change.group_role == new_role:
         raise APIException(400, "10017", "role unchanged")
+    # 管理員可能把唯一的組長降級，群組至少要留一位組長
+    if change.group_role == GroupRole.LEADER and count_group_leaders(db, GroupId) <= 1:
+        raise APIException(400, "10016", "at least one leader")
     change.group_role = new_role
     db.commit()
 
@@ -230,7 +235,8 @@ def update_group(request: Request, data: GroupUpdateRequest, GroupId: str, db: S
     group = db.query(Group).filter(Group.group_id == GroupId, Group.status == GroupStatus.VERIFIED, Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
-    if check_group_member_role(db, user_id, GroupId) != GroupRole.LEADER:
+    # 組長或管理員可以編輯群組
+    if check_group_member_role(db, user_id, GroupId) != GroupRole.LEADER and not is_admin(db, user_id):
         raise APIException(400, "10008", "permission denied")
     group.title = data.title
     group.desc = data.desc
@@ -259,7 +265,8 @@ def delete_group(request: Request, GroupId: str, db: Session = Depends(get_db)) 
                                    Group.is_delete == False).first()
     if group is None:
         raise APIException(404, "10013", "group not found")
-    if check_group_member_role(db, user_id, GroupId) != GroupRole.LEADER:
+    # 組長或管理員可以刪除群組
+    if check_group_member_role(db, user_id, GroupId) != GroupRole.LEADER and not is_admin(db, user_id):
         raise APIException(400, "10008", "permission denied")
     group.is_delete = True
     db.query(GroupAccount).filter(GroupAccount.group_id == GroupId, GroupAccount.is_delete == False) \

@@ -12,6 +12,7 @@ class APIResponse(BaseModel):
     # 其他欄位依需求加
     token: Optional[str] = None
     register_token: Optional[str] = None
+    reset_token: Optional[str] = None
     user_id: Optional[str] = None
     campus_id: Optional[str] = None
     email: Optional[str] = None
@@ -36,8 +37,15 @@ class APIResponse(BaseModel):
     admin: Optional[list] = None
     db_editor: Optional[list] = None
     normal_user: Optional[list] = None
-    change_request_user: Optional[list] = None
-    change_request: Optional[dict] = None
+    # 校外帳號
+    account_type: Optional[str] = None
+    organization: Optional[str] = None
+    valid_until: Optional[datetime] = None
+    invitation: Optional[dict] = None
+    invitations: Optional[list] = None
+    # 在學驗證
+    enrollment: Optional[dict] = None
+    enrollment_pending_user: Optional[list] = None
     
 
 # 錯誤回應的格式 

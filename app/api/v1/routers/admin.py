@@ -1,57 +1,116 @@
 from fastapi import APIRouter, Request, Depends
+from fastapi.responses import FileResponse
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, selectinload
 from app.db.session import get_db
-from app.models.model import Role, GroupRole, GroupStatus, Account, VerifiedInProgress, Group, GroupAccount
+from app.models.model import Role, GroupRole, GroupStatus, Account, EnrollmentStatus, EnrollmentVerification, ExternalInvitation, Group, GroupAccount
 from app.core.exceptions import APIException
 from app.schemas.common import APIResponse
 from datetime import datetime, timedelta
 from app.core.deps import verify_token, return_payload
 from app.core.permissions import count_group_leaders, get_group_members
 from app.schemas.admin import (
+    ExtendExternalRequest,
+    ExternalInviteRequest,
+    RejectEnrollmentRequest,
     UnconfirmGroupRequest
 )
+from app.api.services.enrollment import DELETE_REASON_SUSPENDED, serialize_enrollment, soft_delete_account
+from app.api.services.enrollment_files import enrollment_file_path
+from app.api.services.email import send_external_invitation_email
+from app.api.services.external_accounts import (
+    INVITE_LINK_DAYS,
+    account_extra,
+    extend_valid_until,
+    is_external,
+    new_nonce,
+    normalize_external_email,
+    now_utc,
+    serialize_invitation,
+)
+from app.api.services.enrollment import DISABLED_REASONS, TAIPEI
+from app.core.config import get_settings
+from app.core.jwt import create_invite_token
+import logging
+
+logger = logging.getLogger(__name__)
 import re
 
 router = APIRouter()
 
-def latest_change_request(db: Session, user_id: str):
-    return db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == user_id, VerifiedInProgress.is_delete == False).order_by(VerifiedInProgress.create_time.desc()).first()
-
-
-def latest_change_requests(db: Session) -> dict:
-    # 每位使用者只取最新一筆待審核的學號變更申請
-    pending = db.query(VerifiedInProgress).filter(VerifiedInProgress.is_delete == False).order_by(VerifiedInProgress.create_time.desc()).all()
-    latest = {}
-    for v in pending:
-        latest.setdefault(v.user_id, v)
-    return latest
-
-
-@router.post("/confirm_change/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
-def confirm_change(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+def require_admin(request: Request, db: Session) -> Account:
     verify_token(request)
-    payload = return_payload(request)
-    admin_id = payload["user_id"]
+    admin_id = return_payload(request)["user_id"]
     admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
     if admin is None:
         raise APIException(404, "10001", "user not found")
     if admin.role != Role.ADMIN:
         raise APIException(400, "10008", "permission denied")
-    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    return admin
+
+
+def pending_enrollments(db: Session) -> dict:
+    """每位使用者這一期最新一筆審核中的在學證明"""
+    rows = db.query(EnrollmentVerification).join(
+        Account, Account.user_id == EnrollmentVerification.user_id
+    ).filter(
+        EnrollmentVerification.status == EnrollmentStatus.PENDING,
+        EnrollmentVerification.is_delete == False,
+        EnrollmentVerification.due_year == Account.verify_due_year,
+        Account.is_delete == False,
+    ).order_by(EnrollmentVerification.create_time.asc()).all()
+    latest = {}
+    for row in rows:
+        latest[row.user_id] = row
+    return latest
+
+
+def pending_verification(db: Session, verification_id: str) -> EnrollmentVerification:
+    verification = db.query(EnrollmentVerification).filter(
+        EnrollmentVerification.verification_id == verification_id,
+        EnrollmentVerification.status == EnrollmentStatus.PENDING,
+        EnrollmentVerification.is_delete == False,
+    ).first()
+    if verification is None:
+        raise APIException(404, "10034", "verification not found or already reviewed")
+    return verification
+
+
+@router.get("/enrollment_proof/{VerificationId}")
+def download_enrollment_proof(request: Request, VerificationId: str, db: Session = Depends(get_db)):
+    require_admin(request, db)
+    verification = db.query(EnrollmentVerification).filter(
+        EnrollmentVerification.verification_id == VerificationId,
+        EnrollmentVerification.is_delete == False,
+    ).first()
+    if verification is None:
+        raise APIException(404, "10034", "verification not found")
+    path = enrollment_file_path(verification.stored_name)
+    if not path.is_file():
+        raise APIException(404, "10034", "verification not found")
+    # inline：瀏覽器可以直接預覽 PDF 與圖片
+    return FileResponse(
+        path,
+        media_type=verification.content_type,
+        filename=verification.original_name,
+        content_disposition_type="inline",
+    )
+
+
+@router.post("/approve_enrollment/{VerificationId}", response_model=APIResponse, response_model_exclude_none=True)
+def approve_enrollment(request: Request, VerificationId: str, db: Session = Depends(get_db)) -> dict:
+    admin = require_admin(request, db)
+    verification = pending_verification(db, VerificationId)
+    user = db.query(Account).filter(Account.user_id == verification.user_id, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
-    # 舊資料可能有多筆待審核，以最新一筆為準，其餘一併結案
-    verifications = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_delete == False).order_by(VerifiedInProgress.create_time.desc()).all()
-    if not verifications:
-        raise APIException(404, "10001", "user not found")
-    verification = verifications[0]
-    # 送出申請後學號可能已被其他帳號審核通過
-    if Account.campus_id_taken(db, verification.campus_id, exclude_user_id=UserId):
-        raise APIException(400, "10012", "the same campus id")
-    user.campus_id = verification.campus_id
-    for v in verifications:
-        v.is_delete = True
+    # 只審這一期的證明；通過就延長一年，下次驗證年 + 1
+    if user.verify_due_year != verification.due_year:
+        raise APIException(404, "10034", "verification not found or already reviewed")
+    verification.status = EnrollmentStatus.APPROVED
+    verification.reviewed_by = admin.user_id
+    verification.reviewed_at = datetime.now().astimezone()
+    user.verify_due_year = verification.due_year + 1
     db.commit()
 
     return APIResponse(
@@ -61,24 +120,14 @@ def confirm_change(request: Request, UserId: str, db: Session = Depends(get_db))
     )
 
 
-@router.post("/unconfirm_change/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
-def unconfirm_change(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
-    verify_token(request)
-    payload = return_payload(request)
-    admin_id = payload["user_id"]
-    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
-    if admin is None:
-        raise APIException(404, "10001", "user not found")
-    if admin.role != Role.ADMIN:
-        raise APIException(400, "10008", "permission denied")
-    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
-    if user is None:
-        raise APIException(404, "10001", "user not found")
-    verifications = db.query(VerifiedInProgress).filter(VerifiedInProgress.user_id == UserId, VerifiedInProgress.is_delete == False).all()
-    if not verifications:
-        raise APIException(404, "10001", "user not found")
-    for v in verifications:
-        v.is_delete = True
+@router.post("/reject_enrollment/{VerificationId}", response_model=APIResponse, response_model_exclude_none=True)
+def reject_enrollment(request: Request, VerificationId: str, data: RejectEnrollmentRequest, db: Session = Depends(get_db)) -> dict:
+    admin = require_admin(request, db)
+    verification = pending_verification(db, VerificationId)
+    verification.status = EnrollmentStatus.REJECTED
+    verification.reason = data.reason
+    verification.reviewed_by = admin.user_id
+    verification.reviewed_at = datetime.now().astimezone()
     db.commit()
 
     return APIResponse(
@@ -159,9 +208,9 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             db_editor.append(user)
         elif user.role == Role.NORMAL:
             normal_user.append(user)
-    # 學號變更申請不影響角色，使用者同時也會出現在原本的角色清單
-    change_requests = latest_change_requests(db)
-    change_request_user = [user for user in all_user if user.user_id in change_requests]
+    # 在學驗證不影響角色，使用者同時也會出現在原本的角色清單
+    pending = pending_enrollments(db)
+    users_by_id = {user.user_id: user for user in all_user}
 
     return APIResponse(
         status_code="00000",
@@ -171,7 +220,9 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             {
                 "user_id": a.user_id,
                 "campus_id": a.campus_id,
-                "name": a.name
+                "name": a.name,
+                "account_type": a.account_type,
+                "organization": a.organization
             }
             for a in admin
         ],
@@ -179,7 +230,9 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             {
                 "user_id": de.user_id,
                 "campus_id": de.campus_id,
-                "name": de.name
+                "name": de.name,
+                "account_type": de.account_type,
+                "organization": de.organization
             }
             for de in db_editor
         ],
@@ -187,18 +240,21 @@ def show_all_user(request: Request, db: Session = Depends(get_db)) -> dict:
             {
                 "user_id": nu.user_id,
                 "campus_id": nu.campus_id,
-                "name": nu.name
+                "name": nu.name,
+                "account_type": nu.account_type,
+                "organization": nu.organization
             }
             for nu in normal_user
         ],
-        change_request_user=[
+        enrollment_pending_user=[
             {
-                "user_id": cru.user_id,
-                "campus_id": cru.campus_id,
-                "name": cru.name,
-                "new_campus_id": change_requests[cru.user_id].campus_id
+                "user_id": user_id,
+                "campus_id": users_by_id[user_id].campus_id,
+                "name": users_by_id[user_id].name,
+                "submitted_at": verification.create_time
             }
-            for cru in change_request_user
+            for user_id, verification in pending.items()
+            if user_id in users_by_id
         ],
     )
 
@@ -216,7 +272,6 @@ def show_one_user(request: Request, UserId: str, db: Session = Depends(get_db)) 
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
-    change = latest_change_request(db, UserId)
 
     return APIResponse(
         status_code="00000",
@@ -227,10 +282,8 @@ def show_one_user(request: Request, UserId: str, db: Session = Depends(get_db)) 
         name=user.name,
         email=user.email,
         role=user.role.value,
-        change_request={
-            "campus_id": change.campus_id,
-            "create_time": change.create_time
-        } if change else None
+        enrollment=serialize_enrollment(db, user),
+        **account_extra(user),
     )
 
 
@@ -432,22 +485,19 @@ def remove_admin(request: Request, UserId: str, db: Session = Depends(get_db)) -
     )
 
 
-@router.delete("/delete_user/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
-def delete_user(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
-    verify_token(request)
-    payload = return_payload(request)
-    admin_id = payload["user_id"]
-    admin = db.query(Account).filter(Account.user_id == admin_id, Account.is_delete == False).first()
-    if admin is None:
-        raise APIException(404, "10001", "user not found")
-    if admin.role != Role.ADMIN:
-        raise APIException(400, "10008", "permission denied")
-    if UserId == admin_id:
+@router.post("/suspend_user/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def suspend_user(request: Request, UserId: str, db: Session = Depends(get_db)) -> dict:
+    """停權：帳號軟刪除並退出所有群組（失去組長的群組自動遞補）；之後不能用相同的學號（email 前綴）登入或重新註冊"""
+    admin = require_admin(request, db)
+    if UserId == admin.user_id:
         raise APIException(400, "10015", "can't change own permissions")
     user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
     if user is None:
         raise APIException(404, "10001", "user not found")
-    user.is_delete = True
+    # 只能停權一般使用者；管理員、資料庫編輯者要先移除權限
+    if user.role != Role.NORMAL:
+        raise APIException(400, "10036", "demote before suspending")
+    soft_delete_account(db, user, DELETE_REASON_SUSPENDED)
     db.commit()
 
     return APIResponse(
@@ -482,3 +532,144 @@ def group_search_user(request: Request, Search: str, db: Session = Depends(get_d
             for user in users
         ],
     )
+
+
+def active_invitation(db: Session, invitation_id: str) -> ExternalInvitation:
+    invitation = db.query(ExternalInvitation).filter(
+        ExternalInvitation.invitation_id == invitation_id,
+        ExternalInvitation.is_delete == False,
+        ExternalInvitation.accepted_at.is_(None),
+    ).first()
+    if invitation is None:
+        raise APIException(404, "10041", "invitation not found")
+    return invitation
+
+
+def send_invitation(db: Session, invitation: ExternalInvitation) -> None:
+    """產生新的連結（7 天）並寄信；寄信失敗就整筆不寫入"""
+    invitation.token_nonce = new_nonce()
+    invitation.expires_at = now_utc() + timedelta(days=INVITE_LINK_DAYS)
+    db.flush()
+    token = create_invite_token(invitation.invitation_id, invitation.token_nonce, invitation.expires_at)
+    link = f"{get_settings().frontend_base_url.rstrip('/')}/auth/accept-invite?token={token}"
+    expires_text = invitation.expires_at.astimezone(TAIPEI).strftime("%Y/%m/%d %H:%M")
+    try:
+        send_external_invitation_email(
+            recipient_email=invitation.email,
+            link=link,
+            organization=invitation.organization,
+            valid_years=invitation.valid_years,
+            expires_text=expires_text,
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("校外邀請信寄送失敗：%s", invitation.email)
+        raise APIException(500, "10028", "failed to send invitation email")
+    db.commit()
+
+
+@router.post("/external_invitations", response_model=APIResponse, response_model_exclude_none=True)
+def invite_external(request: Request, data: ExternalInviteRequest, db: Session = Depends(get_db)) -> dict:
+    """邀請校外人士：寄出 7 天有效的設定密碼連結；對方完成設定才建立帳號"""
+    admin = require_admin(request, db)
+    email = normalize_external_email(data.email)
+    if db.query(Account).filter(Account.email == email, Account.is_delete == False).first() is not None:
+        raise APIException(400, "10006", "register duplicate")
+    # 被停權的 email 不能再邀請
+    if db.query(Account).filter(
+        Account.email == email, Account.is_delete == True, Account.delete_reason.in_(DISABLED_REASONS)
+    ).first() is not None:
+        raise APIException(403, "10035", "account suspended")
+    # 同一個 email 已經在邀請中，新的取代舊的（舊連結失效）
+    db.query(ExternalInvitation).filter(
+        ExternalInvitation.email == email,
+        ExternalInvitation.is_delete == False,
+        ExternalInvitation.accepted_at.is_(None),
+    ).update({ExternalInvitation.is_delete: True}, synchronize_session=False)
+    invitation = ExternalInvitation(
+        email=email,
+        organization=data.organization,
+        valid_years=data.valid_years,
+        invited_by=admin.user_id,
+        token_nonce=new_nonce(),
+        expires_at=now_utc(),
+        # 用程式時間：資料庫的 now() 在同一交易內相同，排不出先後
+        create_time=now_utc(),
+    )
+    db.add(invitation)
+    send_invitation(db, invitation)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        invitation=serialize_invitation(invitation),
+    )
+
+
+@router.get("/external_invitations", response_model=APIResponse, response_model_exclude_none=True)
+def list_external_invitations(request: Request, db: Session = Depends(get_db)) -> dict:
+    """還沒完成設定的邀請（含連結已過期的），最新的在前"""
+    require_admin(request, db)
+    invitations = db.query(ExternalInvitation).filter(
+        ExternalInvitation.is_delete == False,
+        ExternalInvitation.accepted_at.is_(None),
+    ).order_by(ExternalInvitation.create_time.desc()).all()
+    now = now_utc()
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        invitations=[serialize_invitation(invitation, now) for invitation in invitations],
+    )
+
+
+@router.post("/external_invitations/{InvitationId}/resend", response_model=APIResponse, response_model_exclude_none=True)
+def resend_external_invitation(request: Request, InvitationId: str, db: Session = Depends(get_db)) -> dict:
+    """重寄：舊連結失效，新連結重新計算 7 天"""
+    require_admin(request, db)
+    invitation = active_invitation(db, InvitationId)
+    send_invitation(db, invitation)
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        invitation=serialize_invitation(invitation),
+    )
+
+
+@router.delete("/external_invitations/{InvitationId}", response_model=APIResponse, response_model_exclude_none=True)
+def cancel_external_invitation(request: Request, InvitationId: str, db: Session = Depends(get_db)) -> dict:
+    """取消邀請：連結立即失效"""
+    require_admin(request, db)
+    invitation = active_invitation(db, InvitationId)
+    invitation.is_delete = True
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+    )
+
+
+@router.post("/extend_external/{UserId}", response_model=APIResponse, response_model_exclude_none=True)
+def extend_external(request: Request, UserId: str, data: ExtendExternalRequest, db: Session = Depends(get_db)) -> dict:
+    """延長校外帳號：還沒到期從原到期日往後加，已到期從今天起算"""
+    require_admin(request, db)
+    user = db.query(Account).filter(Account.user_id == UserId, Account.is_delete == False).first()
+    if user is None:
+        raise APIException(404, "10001", "user not found")
+    if not is_external(user):
+        raise APIException(400, "10042", "not an external account")
+    extend_valid_until(user, data.years)
+    db.commit()
+
+    return APIResponse(
+        status_code="00000",
+        message="success",
+        response_datetime=datetime.now(),
+        valid_until=user.valid_until,
+    )
+

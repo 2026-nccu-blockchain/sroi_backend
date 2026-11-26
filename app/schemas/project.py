@@ -1,10 +1,11 @@
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.models.model import FormStatus, GroupRole
+from app.schemas.financial_proxy import ExchangeRateMonth
 
 
 DEFAULT_PROJECT_NAME = "未命名的專案"
@@ -100,6 +101,7 @@ class TempInterviewFileRead(BaseModel):
 
 class LinkedFormRead(ORMModel):
     form_id: str
+    stakeholder_id: Optional[str]
     title: Optional[str]
     status: FormStatus
 
@@ -168,6 +170,10 @@ class ProjectRead(ORMModel):
     group_id: Optional[str]
     created_by: str
     my_role: Optional[GroupRole] = None
+    # 是否為專案成員；從共用資料庫檢視別人的已發布專案時是 False
+    is_member: bool = True
+    # 作者姓名；目前只有共用資料庫的列表會帶
+    creator_name: Optional[str] = None
     name: str
     organization: str
     description: str
@@ -175,6 +181,12 @@ class ProjectRead(ORMModel):
     begin: datetime
     end: datetime
     status: str
+    closed_at: Optional[datetime] = None
+    # 送審時間；有值且還沒 published_at 表示審核中
+    review_requested_at: Optional[datetime] = None
+    published_at: Optional[datetime] = None
+    # 群組專案草稿：只有建立者看得到
+    is_draft: bool = False
     forms: list[LinkedFormRead] = Field(default_factory=list)
     stakeholders: list[StakeholderRead] = Field(default_factory=list)
     outcomes: list[OutcomeRead] = Field(default_factory=list)
@@ -184,20 +196,48 @@ class ProjectRead(ORMModel):
     update_time: Optional[datetime]
 
 
+class AdminProjectListItem(BaseModel):
+    """管理員所有專案列表的一列；只帶列表用得到的欄位"""
+    project_id: str
+    owner_id: Optional[str]
+    group_id: Optional[str]
+    name: str
+    organization: str
+    begin: datetime
+    end: datetime
+    status: str
+    closed_at: Optional[datetime] = None
+    review_requested_at: Optional[datetime] = None
+    published_at: Optional[datetime] = None
+    creator_name: Optional[str] = None
+    group_title: Optional[str] = None
+    # 取代整包 forms，只為了顯示「已發布／草稿」
+    has_published_form: bool = False
+
+
+class AdminProjectPage(BaseModel):
+    items: list[AdminProjectListItem]
+    total: int
+    page: int
+    page_size: int
+    # {"all": n, "personal": n, "group": n}
+    scope_counts: dict[str, int]
+    # 目前 scope 底下各狀態的數量：{"all": n, "not_started": n, ...}
+    phase_counts: dict[str, int]
+
+
 class OutcomeValuationInput(BaseModel):
     outcome_id: str
-    quantity: Decimal = Field(default=Decimal("0"), ge=0, max_digits=14, decimal_places=2)
     financial_proxy_id: Optional[str] = None
+    exchange_rate_month: ExchangeRateMonth | None = None
     deadweight_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
     attribution_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
     displacement_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
     duration_years: int = Field(default=1, ge=1, le=20)
     dropoff_rate: Decimal = Field(default=Decimal("0"), ge=0, le=1, max_digits=5, decimal_places=4)
-    is_included: bool = True
 
 
 class StakeholderSROIUpdate(BaseModel):
-    discount_rate: Decimal = Field(ge=0, le=1, max_digits=5, decimal_places=4)
     outcomes: list[OutcomeValuationInput] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -216,7 +256,12 @@ class OutcomeValuationRead(BaseModel):
     financial_proxy_id: Optional[str]
     financial_proxy_name: Optional[str]
     financial_proxy_note: Optional[str]
-    financial_proxy_value: Decimal
+    financial_proxy_value: Decimal | None
+    financial_proxy_amount: Decimal | None
+    financial_proxy_currency: str | None
+    exchange_rate_month: ExchangeRateMonth | None
+    exchange_rate: Decimal | None
+    exchange_rate_date: date | None
     deadweight_rate: Decimal
     attribution_rate: Decimal
     displacement_rate: Decimal
@@ -225,8 +270,9 @@ class OutcomeValuationRead(BaseModel):
     is_included: bool
     scale_score: Optional[float]
     scale_answer_count: int
+    scale_passing_question_count: int
     suggested_eligible: Optional[bool]
-    calculated_value: Decimal
+    calculated_value: Decimal | None
 
 
 class StakeholderSROIRead(BaseModel):
@@ -237,7 +283,20 @@ class StakeholderSROIRead(BaseModel):
     stakeholder_role: str
     position: int
     input_cost: Decimal
-    discount_rate: Decimal
+    discount_rate: Decimal = Decimal("0")  # Older clients still read this field.
     outcomes: list[OutcomeValuationRead]
-    total_social_value: Decimal
+    total_social_value: Decimal | None
     sroi_ratio: Optional[Decimal]
+
+
+class ProjectSROIRead(BaseModel):
+    input_cost: Decimal
+    total_social_value: Decimal | None
+    sroi_ratio: Decimal | None
+    included_outcome_count: int
+    missing_proxy_count: int
+    missing_exchange_rate_count: int
+
+
+class ProjectReviewDecision(BaseModel):
+    approved: bool

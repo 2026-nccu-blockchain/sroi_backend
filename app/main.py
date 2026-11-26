@@ -13,6 +13,7 @@ from app.schemas.common import ErrorResponse
 from app.core.middleware import CustomHeaderMiddleware, RateLimitMiddleware
 from app.api.v1.router import api_router
 from app.api.services.interview_files import run_interview_file_maintenance
+from app.api.services.enrollment import run_enrollment_maintenance
 
 
 settings = get_settings()
@@ -24,8 +25,11 @@ WINDOW_SECONDS=settings.window_seconds
 async def lifespan(app: FastAPI):
     # 定期清除沒有儲存的暫存訪綱、壓縮已刪除的訪綱
     maintenance = asyncio.create_task(run_interview_file_maintenance())
+    # 每小時刪除逾期未完成在學驗證的學生帳號
+    enrollment_maintenance = asyncio.create_task(run_enrollment_maintenance())
     yield
     maintenance.cancel()
+    enrollment_maintenance.cancel()
 
 
 app = FastAPI(

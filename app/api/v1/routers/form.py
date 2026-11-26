@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import selectinload, with_loader_criteria
 
+from app.api.services.form_drafts import new_form_consent
 from app.core.deps import return_payload
 from app.core.exceptions import APIException
 from app.core.permissions import accessible_project_filter, require_form_role, require_project_role
@@ -14,13 +15,16 @@ from app.db.session import get_db
 from app.models.model import (
     Answer,
     AnswerChoice,
+    ConsentRecord,
     Form,
+    FormConsent,
     FormResponse,
     FormStatus,
     GroupRole,
     Page,
     Project,
     ProjectOutcome,
+    ProjectStakeholder,
     Question,
     QuestionOption,
     QuestionType,
@@ -28,6 +32,9 @@ from app.models.model import (
 )
 from app.schemas.form import (
     AnswerRead,
+    ConsentRead,
+    ConsentRecordRead,
+    ConsentUpdate,
     FormCreate,
     FormRead,
     FormResponseCreate,
@@ -78,6 +85,7 @@ def _validate_project_outcome(
     outcome_id: str | None,
     user_id: str,
     project_id: str | None = None,
+    stakeholder_id: str | None = None,
 ) -> None:
     if outcome_id is None:
         return
@@ -88,6 +96,8 @@ def _validate_project_outcome(
     )
     if project_id is not None:
         query = query.filter(ProjectOutcome.project_id == project_id)
+    if stakeholder_id is not None:
+        query = query.filter(ProjectOutcome.stakeholder_id == stakeholder_id)
     project = query.first()
     if project is None:
         raise APIException(400, "30003", "Project outcome does not belong to this user")
@@ -97,6 +107,8 @@ def _validate_project_outcome(
 def _form_query(db: Session):
     return db.query(Form).options(
         selectinload(Form.pages).selectinload(Page.questions).selectinload(Question.options),
+        selectinload(Form.consent_versions),
+        selectinload(Form.published_consent),
         with_loader_criteria(Page, Page.is_delete.is_(False)),
         with_loader_criteria(Question, Question.is_delete.is_(False)),
         with_loader_criteria(QuestionOption, QuestionOption.is_delete.is_(False)),
@@ -106,6 +118,7 @@ def _form_query(db: Session):
 def _public_form_query(db: Session):
     return db.query(Form).options(
         selectinload(Form.pages).selectinload(Page.questions).selectinload(Question.options),
+        selectinload(Form.published_consent),
         with_loader_criteria(Page, Page.is_delete.is_(False)),
         with_loader_criteria(
             Question,
@@ -178,6 +191,49 @@ def _ensure_public_token(form: Form) -> None:
         form.public_token = secrets.token_urlsafe(18)
 
 
+def _validate_consent_for_publish(consent: FormConsent | None) -> None:
+    if consent is None:
+        raise APIException(400, "20036", "Informed consent is required before publishing")
+    required_fields = {
+        "同意書標題": consent.title,
+        "主辦單位": consent.organization_name,
+        "同意書內容": consent.content,
+        "聯絡人": consent.contact_name,
+        "聯絡 Email": consent.contact_email,
+    }
+    missing = [label for label, value in required_fields.items() if not value or not value.strip()]
+    if missing:
+        raise APIException(400, "20037", f"Informed consent is incomplete: {', '.join(missing)}")
+
+
+def _publish_consent_snapshot(db: Session, form: Form) -> None:
+    draft = form.draft_consent
+    _validate_consent_for_publish(draft)
+    latest_version = db.query(func.max(FormConsent.version)).filter(
+        FormConsent.form_id == form.form_id,
+        FormConsent.is_published.is_(True),
+    ).scalar() or 0
+    snapshot = FormConsent(
+        form=form,
+        version=latest_version + 1,
+        is_published=True,
+        title=draft.title,
+        organization_name=draft.organization_name,
+        content=draft.content,
+        secondary_use_description=draft.secondary_use_description,
+        withdrawal_method=draft.withdrawal_method,
+        contact_name=draft.contact_name,
+        contact_email=draft.contact_email,
+        contact_phone=draft.contact_phone,
+        requires_guardian=draft.requires_guardian,
+        secondary_use_enabled=draft.secondary_use_enabled,
+        published_at=datetime.now(timezone.utc),
+    )
+    db.add(snapshot)
+    db.flush()
+    form.published_consent = snapshot
+
+
 def _validate_form_for_publish(form: Form) -> None:
     if not form.title or not form.title.strip():
         raise APIException(400, "20026", "Form title is required before publishing")
@@ -186,6 +242,7 @@ def _validate_form_for_publish(form: Form) -> None:
         raise APIException(400, "20027", "At least one block is required before publishing")
     if not any(page.is_respondent_info for page in active_pages):
         raise APIException(400, "20032", "Respondent information block is required before publishing")
+    _validate_consent_for_publish(form.draft_consent)
     for page in active_pages:
         if not page.title or not page.title.strip():
             raise APIException(400, "20028", "Every block needs a title before publishing")
@@ -221,6 +278,7 @@ def create_form(
         status=data.status,
         shuffle_outcome_questions=data.shuffle_outcome_questions,
     )
+    form.consent_versions.append(new_form_consent())
     if data.status == FormStatus.PUBLISHED:
         _ensure_public_token(form)
     if sum(page.is_respondent_info for page in data.pages) > 1:
@@ -242,6 +300,9 @@ def create_form(
 
     db.add(form)
     db.flush()
+    if data.status == FormStatus.PUBLISHED:
+        _validate_form_for_publish(form)
+        _publish_consent_snapshot(db, form)
     ordered_questions = [
         question
         for page in sorted(form.pages, key=lambda item: item.position)
@@ -283,6 +344,29 @@ def get_form(
     return _form_query(db).filter(Form.form_id == form_id).one()
 
 
+@router.put("/{form_id}/consent", response_model=ConsentRead)
+def update_form_consent(
+    form_id: str,
+    data: ConsentUpdate,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> FormConsent:
+    form = _get_form(db, form_id, _user_id(payload), GroupRole.EDITOR)
+    consent = db.query(FormConsent).filter(
+        FormConsent.form_id == form_id,
+        FormConsent.is_published.is_(False),
+        FormConsent.is_delete.is_(False),
+    ).first()
+    if consent is None:
+        consent = new_form_consent()
+        form.consent_versions.append(consent)
+    for field, value in data.model_dump().items():
+        setattr(consent, field, value)
+    db.commit()
+    db.refresh(consent)
+    return consent
+
+
 @router.post("/{form_id}/sync-project-outcomes", response_model=FormRead)
 def sync_project_outcomes(
     form_id: str,
@@ -294,10 +378,13 @@ def sync_project_outcomes(
     if form.project_id is None:
         raise APIException(400, "20035", "Form is not linked to a project")
 
-    pending_outcomes = db.query(ProjectOutcome).filter(
+    pending_query = db.query(ProjectOutcome).filter(
         ProjectOutcome.project_id == form.project_id,
         ProjectOutcome.sync_index > form.outcome_sync_index,
-    ).order_by(ProjectOutcome.sync_index).all()
+    )
+    if form.stakeholder_id is not None:
+        pending_query = pending_query.filter(ProjectOutcome.stakeholder_id == form.stakeholder_id)
+    pending_outcomes = pending_query.order_by(ProjectOutcome.sync_index).all()
     if not pending_outcomes:
         return _form_query(db).filter(Form.form_id == form_id).one()
 
@@ -343,6 +430,8 @@ def get_published_form(public_token: str, db: Session = Depends(get_db)) -> Form
     ).first()
     if form is None:
         raise APIException(404, "20001", "Published form not found")
+    if form.published_consent is None:
+        raise APIException(409, "20038", "This form must be republished with informed consent")
     return form
 
 
@@ -362,6 +451,7 @@ def update_form(
         publishable_form = _form_query(db).filter(Form.form_id == form_id).one()
         _validate_form_for_publish(publishable_form)
         _ensure_public_token(form)
+        _publish_consent_snapshot(db, publishable_form)
     db.commit()
     return _form_query(db).filter(Form.form_id == form_id).one()
 
@@ -428,6 +518,10 @@ def delete_form(
     payload: dict = Depends(return_payload),
 ) -> None:
     form = _get_form(db, form_id, _user_id(payload))
+    if form.stakeholder_id is not None and db.query(ProjectStakeholder.stakeholder_id).filter(
+        ProjectStakeholder.stakeholder_id == form.stakeholder_id, ProjectStakeholder.is_delete.is_(False)
+    ).first():
+        raise APIException(409, "20043", "仍在使用的利害關係人專屬表單無法刪除")
     form.is_delete = True
     db.commit()
 
@@ -451,7 +545,7 @@ def create_page(
             raise APIException(400, "20033", "A form can only have one respondent information block")
         if data.project_outcome_id is not None:
             raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
-    _validate_project_outcome(db, data.project_outcome_id, user_id, form.project_id)
+    _validate_project_outcome(db, data.project_outcome_id, user_id, form.project_id, form.stakeholder_id)
     page = Page(
         form=form,
         project_outcome_id=data.project_outcome_id,
@@ -497,7 +591,9 @@ def update_page(
         if changes.get("project_outcome_id", page.project_outcome_id) is not None:
             raise APIException(400, "20034", "Respondent information block cannot link to a project outcome")
     if "project_outcome_id" in changes:
-        _validate_project_outcome(db, changes["project_outcome_id"], user_id, page.form.project_id)
+        _validate_project_outcome(
+            db, changes["project_outcome_id"], user_id, page.form.project_id, page.form.stakeholder_id,
+        )
     for field, value in changes.items():
         setattr(page, field, value)
     db.commit()
@@ -653,8 +749,12 @@ def _serialize_response(response: FormResponse) -> FormResponseRead:
         form_id=response.form_id,
         respondent_email=response.respondent_email,
         status=response.status,
+        is_duplicate_legacy=response.is_duplicate_legacy,
         started_at=response.started_at,
         submitted_at=response.submitted_at,
+        consent=ConsentRecordRead.model_validate(response.consent_record)
+        if response.consent_record is not None
+        else None,
         answers=[AnswerRead(
             answer_id=answer.answer_id,
             question_id=answer.question_id,
@@ -699,7 +799,8 @@ def submit_response(
     db: Session = Depends(get_db),
 ) -> FormResponseRead:
     form = db.query(Form).options(
-        selectinload(Form.questions).selectinload(Question.options)
+        selectinload(Form.questions).selectinload(Question.options),
+        selectinload(Form.published_consent),
     ).filter(
         Form.public_token == public_token,
         Form.status == FormStatus.PUBLISHED,
@@ -707,6 +808,23 @@ def submit_response(
     ).first()
     if form is None:
         raise APIException(404, "20001", "Published form not found")
+
+    consent = form.published_consent
+    submitted_consent = data.consent
+    if consent is None:
+        raise APIException(409, "20038", "This form must be republished with informed consent")
+    if submitted_consent.consent_id != consent.consent_id:
+        raise APIException(409, "20039", "Informed consent was updated; please reload the form")
+    if not submitted_consent.participant_agreed:
+        raise APIException(400, "20040", "Participant consent is required")
+    participant_name = submitted_consent.participant_name.strip()
+    if not participant_name:
+        raise APIException(400, "20041", "Participant signature is required")
+    guardian_name = (submitted_consent.guardian_name or "").strip() or None
+    guardian_relationship = (submitted_consent.guardian_relationship or "").strip() or None
+    if consent.requires_guardian and not submitted_consent.is_adult:
+        if not guardian_name or not guardian_relationship or not submitted_consent.guardian_agreed:
+            raise APIException(400, "20042", "Guardian consent is required for a minor participant")
 
     respondent_email = str(data.respondent_email).strip().lower()
     existing_response = db.query(FormResponse.response_id).filter(
@@ -752,6 +870,25 @@ def submit_response(
         status=ResponseStatus.SUBMITTED,
         submitted_at=datetime.now(timezone.utc),
     )
+    response.consent_record = ConsentRecord(
+        consent=consent,
+        respondent_email=respondent_email,
+        participant_name=participant_name,
+        participant_agreed=True,
+        secondary_use_agreed=(
+            submitted_consent.secondary_use_agreed
+            if consent.secondary_use_enabled
+            else False
+        ),
+        is_adult=submitted_consent.is_adult,
+        guardian_name=guardian_name,
+        guardian_relationship=guardian_relationship,
+        guardian_agreed=(
+            submitted_consent.guardian_agreed
+            if consent.requires_guardian and not submitted_consent.is_adult
+            else None
+        ),
+    )
     for question_id, submitted_answer in submitted.items():
         question = questions[question_id]
         answer = Answer(
@@ -776,7 +913,8 @@ def submit_response(
         db.rollback()
         raise APIException(409, "20016", "這個 Email 已填寫過此表單") from error
     response = db.query(FormResponse).options(
-        selectinload(FormResponse.answers).selectinload(Answer.selected_options)
+        selectinload(FormResponse.answers).selectinload(Answer.selected_options),
+        selectinload(FormResponse.consent_record),
     ).filter(FormResponse.response_id == response.response_id).one()
     return _serialize_response(response)
 
@@ -790,6 +928,7 @@ def list_responses(
     _get_form(db, form_id, _user_id(payload), GroupRole.VIEWER)
     responses = db.query(FormResponse).options(
         selectinload(FormResponse.answers).selectinload(Answer.selected_options),
+        selectinload(FormResponse.consent_record),
         with_loader_criteria(Answer, Answer.is_delete.is_(False)),
     ).filter(
         FormResponse.form_id == form_id,

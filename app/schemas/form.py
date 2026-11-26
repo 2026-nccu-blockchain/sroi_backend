@@ -147,6 +147,36 @@ class FormStructureSave(BaseModel):
     pages: list[PageStructure] = Field(min_length=1)
 
 
+class ConsentUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=255)
+    organization_name: str = Field(min_length=1, max_length=255)
+    content: str = Field(min_length=1)
+    secondary_use_description: str = ""
+    withdrawal_method: str = ""
+    contact_name: str = Field(default="", max_length=255)
+    contact_email: str = Field(default="", max_length=255)
+    contact_phone: str = Field(default="", max_length=100)
+    requires_guardian: bool = True
+    secondary_use_enabled: bool = True
+
+
+class ConsentRead(ORMModel):
+    consent_id: str
+    version: int
+    is_published: bool
+    title: str
+    organization_name: str
+    content: str
+    secondary_use_description: str
+    withdrawal_method: str
+    contact_name: str
+    contact_email: str
+    contact_phone: str
+    requires_guardian: bool
+    secondary_use_enabled: bool
+    published_at: Optional[datetime]
+
+
 class FormRead(ORMModel):
     form_id: str
     project_id: Optional[str]
@@ -160,6 +190,7 @@ class FormRead(ORMModel):
     create_time: Optional[datetime]
     update_time: Optional[datetime]
     pages: list[PageRead] = Field(default_factory=list)
+    consent: Optional[ConsentRead] = Field(default=None, validation_alias="draft_consent")
 
 
 class PublicFormRead(ORMModel):
@@ -168,6 +199,7 @@ class PublicFormRead(ORMModel):
     content: Optional[str]
     shuffle_outcome_questions: bool
     pages: list[PageRead] = Field(default_factory=list)
+    consent: ConsentRead = Field(validation_alias="published_consent")
 
 
 class AnswerInput(BaseModel):
@@ -178,8 +210,20 @@ class AnswerInput(BaseModel):
     option_ids: list[str] = Field(default_factory=list)
 
 
+class ConsentSubmission(BaseModel):
+    consent_id: str
+    participant_name: str = Field(min_length=1, max_length=255)
+    participant_agreed: bool
+    secondary_use_agreed: bool = False
+    is_adult: bool
+    guardian_name: Optional[str] = Field(default=None, max_length=255)
+    guardian_relationship: Optional[str] = Field(default=None, max_length=100)
+    guardian_agreed: Optional[bool] = None
+
+
 class FormResponseCreate(BaseModel):
     respondent_email: EmailStr
+    consent: ConsentSubmission
     answers: list[AnswerInput] = Field(default_factory=list)
 
 
@@ -200,11 +244,26 @@ class AnswerRead(ORMModel):
     option_ids: list[str] = Field(default_factory=list)
 
 
+class ConsentRecordRead(ORMModel):
+    consent_record_id: str
+    consent_id: str
+    participant_name: str
+    participant_agreed: bool
+    secondary_use_agreed: bool
+    is_adult: bool
+    guardian_name: Optional[str]
+    guardian_relationship: Optional[str]
+    guardian_agreed: Optional[bool]
+    consented_at: datetime
+
+
 class FormResponseRead(ORMModel):
     response_id: str
     form_id: str
     respondent_email: Optional[str]
     status: ResponseStatus
+    is_duplicate_legacy: bool
     started_at: datetime
     submitted_at: Optional[datetime]
     answers: list[AnswerRead] = Field(default_factory=list)
+    consent: Optional[ConsentRecordRead] = Field(default=None, validation_alias="consent_record")

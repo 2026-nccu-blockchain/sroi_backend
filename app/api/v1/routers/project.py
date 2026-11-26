@@ -1,6 +1,8 @@
 import io
 import shutil
-from datetime import datetime, timezone
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Literal, Optional
@@ -8,9 +10,14 @@ from zipfile import BadZipFile, ZipFile
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
 from fastapi.responses import FileResponse
+from sqlalchemy import func, literal
 from sqlalchemy.orm import Session, selectinload, with_loader_criteria
+from sqlalchemy import and_, case, exists, func, or_
+from sqlalchemy.orm import Session, aliased, selectinload, with_loader_criteria
 from starlette.concurrency import run_in_threadpool
 
+from app.api.services.exchange_rates import get_exchange_rates, month_end_date
+from app.api.services.form_drafts import add_stakeholder_form
 from app.api.services.interview_files import (
     INTERVIEW_UPLOAD_DIR,
     discard_temp_interview_file,
@@ -24,16 +31,24 @@ from app.core.exceptions import APIException
 from app.core.permissions import (
     accessible_project_filter,
     get_group_role,
+    get_member_project_role,
     get_user_group_roles,
     has_role,
+    can_review_database,
+    is_admin,
+    can_review_projects,
+    is_project_reviewing,
     require_project_role,
 )
 from app.db.session import get_db
 from app.models.model import (
+    Account,
     Answer,
     Form,
     FormResponse,
     FinancialProxy,
+    FormStatus,
+    Group,
     GroupRole,
     Page,
     Project,
@@ -47,11 +62,15 @@ from app.models.model import (
     ResponseStatus,
 )
 from app.schemas.project import (
+    AdminProjectListItem,
+    AdminProjectPage,
     CostInput,
     OutcomeInput,
     ProjectCostsRead,
     ProjectCreate,
     ProjectRead,
+    ProjectReviewDecision,
+    ProjectSROIRead,
     StakeholderSROIRead,
     StakeholderSROIUpdate,
     ProjectUpdate,
@@ -67,7 +86,6 @@ READ_CHUNK_SIZE = 1024 * 1024
 NON_NULLABLE_PROJECT_FIELDS = {"name", "organization", "description", "begin", "end", "status"}
 MONEY_QUANTUM = Decimal("0.01")
 RATIO_QUANTUM = Decimal("0.0001")
-OUTCOME_ELIGIBILITY_THRESHOLD = Decimal("0.5")
 
 
 def _user_id(payload: dict) -> str:
@@ -94,13 +112,21 @@ def _project_query(db: Session):
     )
 
 
-def _get_project(db: Session, project_id: str, user_id: str, min_role: GroupRole) -> Project:
+def _get_project(
+    db: Session,
+    project_id: str,
+    user_id: str,
+    min_role: GroupRole,
+    allow_closed: bool = False,
+) -> Project:
     project = _project_query(db).filter(
         Project.project_id == project_id,
         Project.is_delete.is_(False),
     ).first()
-    role = require_project_role(db, project, user_id, min_role)
+    role = require_project_role(db, project, user_id, min_role, allow_closed=allow_closed)
     project.my_role = role.value
+    # 從共用資料庫打開別人的已發布專案時是 False，前端據此決定返回哪裡
+    project.is_member = get_member_project_role(db, project, user_id) is not None
     return project
 
 
@@ -119,13 +145,9 @@ def _outcome_value(
     displacement_rate: Decimal,
     duration_years: int,
     dropoff_rate: Decimal,
-    discount_rate: Decimal,
-    is_included: bool,
 ) -> Decimal:
-    if not is_included:
-        return Decimal("0")
     one = Decimal("1")
-    base = (
+    annual_value = (
         quantity
         * financial_proxy_value
         * (one - deadweight_rate)
@@ -133,9 +155,18 @@ def _outcome_value(
         * (one - displacement_rate)
     )
     total = Decimal("0")
-    for year in range(duration_years):
-        total += base * ((one - dropoff_rate) ** year) / ((one + discount_rate) ** year)
+    for _ in range(duration_years):
+        total += annual_value
+        annual_value *= one - dropoff_rate
     return total.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+@dataclass
+class OutcomeScaleMetric:
+    highest_score: Decimal = Decimal("0")
+    answer_count: int = 0
+    passing_question_count: int = 0
+    respondent_count: int = 0
 
 
 def _outcome_scale_metrics(
@@ -143,14 +174,18 @@ def _outcome_scale_metrics(
     project_id: str,
     outcome_ids: set[str],
     form_ids: set[str] | None = None,
-) -> dict[str, tuple[float, int]]:
-    if not outcome_ids:
+) -> dict[str, OutcomeScaleMetric]:
+    if not outcome_ids or (form_ids is not None and not form_ids):
         return {}
+    email = func.nullif(func.lower(func.trim(FormResponse.respondent_email)), "")
+    respondent_key = func.coalesce(literal("email:") + email, literal("response:") + FormResponse.response_id)
     query = db.query(
-        Page.project_outcome_id,
-        Answer.number_value,
+        Page.project_outcome_id.label("outcome_id"),
+        Question.question_id,
         Question.scale_begin,
         Question.scale_end,
+        Answer.number_value,
+        respondent_key.label("respondent_key"),
     ).join(
         Form,
         Form.form_id == Page.form_id,
@@ -171,30 +206,41 @@ def _outcome_scale_metrics(
         Question.question_type == QuestionType.SC,
         Question.is_temp.is_(False),
         Question.is_delete.is_(False),
-        Answer.number_value.is_not(None),
+        Question.scale_end > Question.scale_begin,
+        Answer.number_value.between(Question.scale_begin, Question.scale_end),
         Answer.is_delete.is_(False),
+        FormResponse.form_id == Form.form_id,
         FormResponse.status == ResponseStatus.SUBMITTED,
         FormResponse.is_duplicate_legacy.is_(False),
         FormResponse.is_delete.is_(False),
     )
     if form_ids is not None:
-        if not form_ids:
-            return {}
         query = query.filter(Form.form_id.in_(form_ids))
-    rows = query.all()
+    valid_answers = query.cte("valid_scale_answers")
+    answers = valid_answers.c
+    respondents = db.query(
+        answers.outcome_id,
+        func.count(answers.respondent_key.distinct()).label("respondent_count"),
+    ).group_by(answers.outcome_id).subquery("outcome_respondents")
+    rows = db.query(
+        answers.outcome_id, answers.question_id, answers.scale_begin, answers.scale_end,
+        func.sum(answers.number_value), func.count(), respondents.c.respondent_count,
+    ).select_from(valid_answers).join(
+        respondents, respondents.c.outcome_id == answers.outcome_id,
+    ).group_by(
+        answers.outcome_id, answers.question_id, answers.scale_begin, answers.scale_end,
+        respondents.c.respondent_count,
+    ).all()
 
-    scores: dict[str, list[Decimal]] = {outcome_id: [] for outcome_id in outcome_ids}
-    for outcome_id, number_value, scale_begin, scale_end in rows:
-        if outcome_id is None or scale_begin is None or scale_end is None or scale_end <= scale_begin:
-            continue
-        normalized = (Decimal(number_value) - Decimal(scale_begin)) / Decimal(scale_end - scale_begin)
-        scores[outcome_id].append(max(Decimal("0"), min(Decimal("1"), normalized)))
-
-    return {
-        outcome_id: (float(sum(values, Decimal("0")) / len(values)), len(values))
-        for outcome_id, values in scores.items()
-        if values
-    }
+    metrics: dict[str, OutcomeScaleMetric] = {}
+    for outcome_id, _, begin, end, score_sum, count, respondent_count in rows:
+        metric = metrics.setdefault(outcome_id, OutcomeScaleMetric(respondent_count=respondent_count))
+        normalized = Decimal(score_sum - begin * count) / ((end - begin) * count)
+        metric.highest_score = max(metric.highest_score, normalized)
+        metric.answer_count += count
+        if 2 * score_sum >= (begin + end) * count:
+            metric.passing_question_count += 1
+    return metrics
 
 
 def _active_stakeholders(project: Project) -> list[ProjectStakeholder]:
@@ -254,7 +300,9 @@ def _serialize_stakeholder_sroi(
     outcome_ids = {outcome.outcome_id for outcome in stakeholder_outcomes}
     valuations = {
         valuation.outcome_id: valuation
-        for valuation in db.query(ProjectOutcomeValuation).filter(
+        for valuation in db.query(ProjectOutcomeValuation).options(
+            selectinload(ProjectOutcomeValuation.financial_proxy),
+        ).filter(
             ProjectOutcomeValuation.project_id == project.project_id,
             ProjectOutcomeValuation.stakeholder_id == stakeholder.stakeholder_id,
             ProjectOutcomeValuation.outcome_id.in_(outcome_ids) if outcome_ids else False,
@@ -269,10 +317,13 @@ def _serialize_stakeholder_sroi(
         ),
         Decimal("0"),
     ).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
-    discount_rate = _decimal(stakeholder.sroi_discount_rate, "0.035")
     linked_form_ids = {
         form_id for form_id in (stakeholder.pre_form_id, stakeholder.post_form_id) if form_id
     }
+    linked_form_ids.update(
+        form.form_id for form in project.forms
+        if form.stakeholder_id == stakeholder.stakeholder_id and not form.is_delete
+    )
     scale_metrics = _outcome_scale_metrics(
         db,
         project.project_id,
@@ -282,37 +333,58 @@ def _serialize_stakeholder_sroi(
     serialized_outcomes: list[dict] = []
     total_social_value = Decimal("0")
     has_missing_proxy = False
+    has_missing_exchange_rate = False
+    has_eligible_outcome = False
+    currencies_by_date: dict[date | None, set[str]] = defaultdict(set)
+    proxies_by_outcome: dict[str, FinancialProxy] = {}
+    dates_by_outcome: dict[str, date | None] = {}
+    for outcome_id, valuation in valuations.items():
+        proxy = valuation.financial_proxy
+        if proxy is None or proxy.is_delete or proxy.review_status != "approved":
+            continue
+        rate_date = month_end_date(valuation.exchange_rate_month)
+        currencies_by_date[rate_date].add(proxy.currency)
+        proxies_by_outcome[outcome_id] = proxy
+        dates_by_outcome[outcome_id] = rate_date
+    rates_by_date = {
+        rate_date: get_exchange_rates(currencies, rate_date)
+        for rate_date, currencies in currencies_by_date.items()
+    }
 
     for outcome in stakeholder_outcomes:
         valuation = valuations.get(outcome.outcome_id)
-        proxy = valuation.financial_proxy if valuation else None
-        if proxy is not None and proxy.is_delete:
-            proxy = None
-        quantity = _decimal(valuation.quantity if valuation else None)
-        financial_proxy_value = _decimal(proxy.value if proxy else None)
+        proxy = proxies_by_outcome.get(outcome.outcome_id)
+        exchange = rates_by_date[dates_by_outcome[outcome.outcome_id]].get(proxy.currency) if proxy else None
+        financial_proxy_value = proxy.value * exchange.rate_to_twd if proxy and exchange else None
         deadweight_rate = _decimal(valuation.deadweight_rate if valuation else None)
         attribution_rate = _decimal(valuation.attribution_rate if valuation else None)
         displacement_rate = _decimal(valuation.displacement_rate if valuation else None)
         duration_years = valuation.duration_years if valuation else 1
         dropoff_rate = _decimal(valuation.dropoff_rate if valuation else None)
-        is_included = valuation.is_included if valuation else True
-        calculated_value = _outcome_value(
-            quantity=quantity,
-            financial_proxy_value=financial_proxy_value,
-            deadweight_rate=deadweight_rate,
-            attribution_rate=attribution_rate,
-            displacement_rate=displacement_rate,
-            duration_years=duration_years,
-            dropoff_rate=dropoff_rate,
-            discount_rate=discount_rate,
-            is_included=is_included,
-        )
-        total_social_value += calculated_value
+        metric = scale_metrics.get(outcome.outcome_id)
+        passing_count = metric.passing_question_count if metric else 0
+        is_included = passing_count > 0
+        quantity = Decimal(metric.respondent_count) if metric and is_included else Decimal("0")
+        has_eligible_outcome = has_eligible_outcome or is_included
+        calculated_value = None
+        if not is_included:
+            calculated_value = Decimal("0")
+        elif financial_proxy_value is not None:
+            calculated_value = _outcome_value(
+                quantity=quantity,
+                financial_proxy_value=financial_proxy_value,
+                deadweight_rate=deadweight_rate,
+                attribution_rate=attribution_rate,
+                displacement_rate=displacement_rate,
+                duration_years=duration_years,
+                dropoff_rate=dropoff_rate,
+            )
+        if calculated_value is not None:
+            total_social_value += calculated_value
         if is_included and proxy is None:
             has_missing_proxy = True
-        metric = scale_metrics.get(outcome.outcome_id)
-        scale_score = metric[0] if metric else None
-        answer_count = metric[1] if metric else 0
+        if is_included and proxy is not None and exchange is None:
+            has_missing_exchange_rate = True
         serialized_outcomes.append({
             "outcome_id": outcome.outcome_id,
             "outcome_name": outcome.name,
@@ -322,21 +394,27 @@ def _serialize_stakeholder_sroi(
             "financial_proxy_name": proxy.name if proxy else None,
             "financial_proxy_note": proxy.note if proxy else None,
             "financial_proxy_value": financial_proxy_value,
+            "financial_proxy_amount": proxy.value if proxy else None,
+            "financial_proxy_currency": proxy.currency if proxy else None,
+            "exchange_rate_month": valuation.exchange_rate_month if valuation else None,
+            "exchange_rate": exchange.rate_to_twd if exchange else None,
+            "exchange_rate_date": exchange.date if exchange else None,
             "deadweight_rate": deadweight_rate,
             "attribution_rate": attribution_rate,
             "displacement_rate": displacement_rate,
             "duration_years": duration_years,
             "dropoff_rate": dropoff_rate,
             "is_included": is_included,
-            "scale_score": scale_score,
-            "scale_answer_count": answer_count,
-            "suggested_eligible": scale_score > float(OUTCOME_ELIGIBILITY_THRESHOLD) if scale_score is not None else None,
+            "scale_score": float(metric.highest_score) if metric else None,
+            "scale_answer_count": metric.answer_count if metric else 0,
+            "scale_passing_question_count": passing_count,
+            "suggested_eligible": is_included if metric else None,
             "calculated_value": calculated_value,
         })
 
     total_social_value = total_social_value.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
     sroi_ratio = None
-    if input_cost > 0 and not has_missing_proxy:
+    if has_eligible_outcome and input_cost > 0 and not has_missing_proxy and not has_missing_exchange_rate:
         sroi_ratio = (total_social_value / input_cost).quantize(
             RATIO_QUANTUM,
             rounding=ROUND_HALF_UP,
@@ -349,9 +427,8 @@ def _serialize_stakeholder_sroi(
         "stakeholder_role": stakeholder.stakeholder_type,
         "position": stakeholder.position,
         "input_cost": input_cost,
-        "discount_rate": discount_rate,
         "outcomes": serialized_outcomes,
-        "total_social_value": total_social_value,
+        "total_social_value": None if has_missing_exchange_rate else total_social_value,
         "sroi_ratio": sroi_ratio,
     }
 
@@ -373,16 +450,20 @@ def _validate_stakeholder_forms(
         return
     if project_id is None:
         raise APIException(400, "30002", "Linked form does not belong to this project")
-    valid_ids = {
-        form_id
-        for (form_id,) in db.query(Form.form_id).filter(
+    owners = {
+        form_id: stakeholder_id
+        for form_id, stakeholder_id in db.query(Form.form_id, Form.stakeholder_id).filter(
             Form.form_id.in_(form_ids),
             Form.project_id == project_id,
             Form.is_delete.is_(False),
         ).all()
     }
-    if valid_ids != form_ids:
+    if set(owners) != form_ids:
         raise APIException(400, "30002", "Linked form does not belong to this project")
+    for item in items:
+        for form_id in (item.pre_form_id, item.post_form_id):
+            if form_id and owners[form_id] not in (None, item.stakeholder_id):
+                raise APIException(400, "30002", "只能指定專案共用表單或這位利害關係人的專屬表單")
 
 
 def _as_aware(value: datetime) -> datetime:
@@ -582,8 +663,17 @@ def list_projects(
     payload: dict = Depends(return_payload),
 ) -> list[Project]:
     user_id = _user_id(payload)
+    # 管理員看指定群組的專案時不限成員（管理員的群組頁）；權限仍是檢視者，由 get_project_role 決定；別人的草稿不顯示
+    visible = (
+        and_(
+            Project.group_id == group_id,
+            or_(Project.is_draft.is_(False), Project.created_by == user_id),
+        )
+        if group_id is not None and is_admin(db, user_id)
+        else accessible_project_filter(db, user_id)
+    )
     query = _project_query(db).filter(
-        accessible_project_filter(db, user_id),
+        visible,
         Project.is_delete.is_(False),
     )
     if scope == "personal":
@@ -596,9 +686,200 @@ def list_projects(
 
     group_roles = get_user_group_roles(db, user_id)
     for project in projects:
-        role = GroupRole.LEADER if project.is_personal else group_roles[project.group_id]
-        project.my_role = role.value
+        if project.is_personal:
+            role = GroupRole.LEADER
+        elif project.is_draft:
+            # 篩選條件保證草稿一定是自己建立的；建立者對自己的草稿視同組長
+            role = GroupRole.LEADER if project.group_id in group_roles else None
+        else:
+            role = group_roles.get(project.group_id)
+        # 只有管理員看非成員群組時會是 None
+        project.is_member = role is not None
+        project.my_role = (role or GroupRole.VIEWER).value
     return projects
+
+
+# 要放在 /{project_id} 之前，不然 "published" 會被當成專案 id
+@router.get("/published", response_model=list[ProjectRead])
+def list_published_projects(
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> list[Project]:
+    """共用資料庫：所有登入使用者都看得到已發布至資料庫的專案。"""
+    user_id = _user_id(payload)
+    projects = _project_query(db).options(selectinload(Project.creator)).filter(
+        Project.published_at.isnot(None),
+        Project.is_delete.is_(False),
+    ).order_by(Project.published_at.desc()).all()
+
+    # 不是成員的人也能以檢視者身分打開，跟 get_project_role 的規則一致
+    group_roles = get_user_group_roles(db, user_id)
+    for project in projects:
+        if project.is_personal:
+            role = GroupRole.LEADER if project.owner_id == user_id else None
+        else:
+            role = group_roles.get(project.group_id)
+        project.is_member = role is not None
+        project.my_role = (role or GroupRole.VIEWER).value
+        # 作者：建立專案的人
+        project.creator_name = project.creator.name if project.creator else None
+    return projects
+
+
+def _require_reviewer(db: Session, user_id: str) -> None:
+    if not can_review_database(db, user_id):
+        raise APIException(403, "30019", "只有資料庫編輯者或管理員能審核專案")
+
+
+# 同樣要放在 /{project_id} 之前
+@router.get("/reviewing", response_model=list[ProjectRead])
+def list_reviewing_projects(
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> list[Project]:
+    """審核專案：資料庫編輯者、管理員看得到所有審核中的專案，依送審時間排序。"""
+    user_id = _user_id(payload)
+    _require_reviewer(db, user_id)
+    projects = _project_query(db).options(selectinload(Project.creator)).filter(
+        Project.closed_at.isnot(None),
+        Project.review_requested_at.isnot(None),
+        Project.published_at.is_(None),
+        Project.is_delete.is_(False),
+    ).order_by(Project.review_requested_at.asc()).all()
+
+    group_roles = get_user_group_roles(db, user_id)
+    for project in projects:
+        if project.is_personal:
+            role = GroupRole.LEADER if project.owner_id == user_id else None
+        else:
+            role = group_roles.get(project.group_id)
+        project.is_member = role is not None
+        project.my_role = (role or GroupRole.VIEWER).value
+        project.creator_name = project.creator.name if project.creator else None
+    return projects
+
+
+PROJECT_PHASES = ("not_started", "in_progress", "pending_close", "closed", "reviewing", "published")
+
+
+def _phase_expr():
+    """和前端 getProjectPhase 相同的規則，改在資料庫算；時間用資料庫的 now()"""
+    now = func.now()
+    return case(
+        (Project.published_at.isnot(None), "published"),
+        (and_(Project.closed_at.isnot(None), Project.review_requested_at.isnot(None)), "reviewing"),
+        (Project.closed_at.isnot(None), "closed"),
+        (Project.begin > now, "not_started"),
+        (Project.end >= now, "in_progress"),
+        else_="pending_close",
+    )
+
+
+# 用 ! 當跳脫字元，不受資料庫 standard_conforming_strings 對反斜線的影響
+def _escape_like(keyword: str) -> str:
+    return keyword.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+
+
+# 同樣要放在 /{project_id} 之前
+@router.get("/all", response_model=AdminProjectPage)
+def list_all_projects(
+    scope: Literal["all", "personal", "group"] = "all",
+    phase: Literal["all", "not_started", "in_progress", "pending_close", "closed", "reviewing", "published"] = "all",
+    q: str = Query(default="", max_length=100),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> dict:
+    """管理員：所有人的個人專案與所有群組專案；篩選、搜尋、計數、分頁都在資料庫做。"""
+    user_id = _user_id(payload)
+    if not is_admin(db, user_id):
+        raise APIException(403, "10008", "permission denied")
+
+    creator = aliased(Account)
+    phase_col = _phase_expr()
+    is_group = Project.group_id.isnot(None)
+    keyword = q.strip()
+
+    # 共用的 FROM + 基本條件：未刪除 + 搜尋（名稱、單位、建立者、群組名）
+    def base(*columns):
+        query = db.query(*columns).select_from(Project).outerjoin(
+            creator, creator.user_id == Project.created_by
+        ).outerjoin(
+            Group, Group.group_id == Project.group_id
+        ).filter(
+            Project.is_delete.is_(False),
+            # 群組草稿只有建立者看得到，管理員也看不到
+            or_(Project.is_draft.is_(False), Project.created_by == user_id),
+        )
+        if keyword:
+            pattern = f"%{_escape_like(keyword)}%"
+            query = query.filter(or_(
+                Project.name.ilike(pattern, escape="!"),
+                Project.organization.ilike(pattern, escape="!"),
+                creator.name.ilike(pattern, escape="!"),
+                Group.title.ilike(pattern, escape="!"),
+            ))
+        return query
+
+    # 一次拿到 (個人/群組) × 狀態 的數量，兩層分頁的數字都從這裡算
+    # 先包成子查詢再 GROUP BY，避免 CASE 裡的字串參數在 SELECT 和 GROUP BY 被當成不同運算式
+    counted = base(is_group.label("is_group"), phase_col.label("phase")).subquery()
+    scope_counts = {"all": 0, "personal": 0, "group": 0}
+    phase_counts = {key: 0 for key in ("all", *PROJECT_PHASES)}
+    for grouped, phase_value, count in db.query(
+        counted.c.is_group, counted.c.phase, func.count()
+    ).group_by(counted.c.is_group, counted.c.phase).all():
+        scope_key = "group" if grouped else "personal"
+        scope_counts["all"] += count
+        scope_counts[scope_key] += count
+        if scope in ("all", scope_key):
+            phase_counts["all"] += count
+            phase_counts[phase_value] += count
+
+    has_published_form = exists().where(
+        Form.project_id == Project.project_id,
+        Form.is_delete.is_(False),
+        Form.status == FormStatus.PUBLISHED,
+    )
+    items_query = base(
+        Project.project_id,
+        Project.owner_id,
+        Project.group_id,
+        Project.name,
+        Project.organization,
+        Project.begin,
+        Project.end,
+        Project.status,
+        Project.closed_at,
+        Project.review_requested_at,
+        Project.published_at,
+        creator.name.label("creator_name"),
+        Group.title.label("group_title"),
+        has_published_form.label("has_published_form"),
+    )
+    if scope == "personal":
+        items_query = items_query.filter(Project.group_id.is_(None))
+    elif scope == "group":
+        items_query = items_query.filter(Project.group_id.isnot(None))
+    if phase != "all":
+        items_query = items_query.filter(phase_col == phase)
+
+    rows = items_query.order_by(
+        Project.update_time.desc().nullslast(),
+        Project.create_time.desc(),
+        # 排序要穩定，翻頁才不會重複或漏掉
+        Project.project_id,
+    ).offset((page - 1) * page_size).limit(page_size).all()
+
+    return {
+        "items": [AdminProjectListItem.model_validate(dict(row._mapping)) for row in rows],
+        "total": phase_counts[phase],
+        "page": page,
+        "page_size": page_size,
+        "scope_counts": scope_counts,
+        "phase_counts": phase_counts,
+    }
 
 
 @router.post("", response_model=ProjectRead, status_code=status.HTTP_201_CREATED)
@@ -622,11 +903,15 @@ def create_project(
         begin=data.begin,
         end=data.end,
         status=data.status,
+        # 群組專案建立後先是草稿，只有建立者看得到
+        is_draft=data.group_id is not None,
     )
     saved_stakeholders = _replace_stakeholders(project, data.stakeholders)
     _, costs_sent = _apply_stakeholder_children(project, data.stakeholders, saved_stakeholders)
     db.add(project)
     db.flush()
+    for stakeholder in saved_stakeholders:
+        add_stakeholder_form(project, stakeholder, user_id)
     if costs_sent:
         _sync_actual_input_cost(db, project)
     db.commit()
@@ -640,6 +925,46 @@ def get_project(
     payload: dict = Depends(return_payload),
 ) -> Project:
     return _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
+
+
+@router.get(
+    "/{project_id}/sroi",
+    response_model=ProjectSROIRead,
+)
+def get_project_sroi(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> ProjectSROIRead:
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.VIEWER)
+    input_cost = _decimal(project.actual_input_cost)
+    total_social_value = Decimal("0")
+    included_count = 0
+    missing_proxy_count = 0
+    missing_exchange_rate_count = 0
+    for stakeholder in _active_stakeholders(project):
+        result = _serialize_stakeholder_sroi(db, project, stakeholder)
+        for outcome in result["outcomes"]:
+            if not outcome["is_included"]:
+                continue
+            included_count += 1
+            if outcome["calculated_value"] is not None:
+                total_social_value += outcome["calculated_value"]
+            elif outcome["financial_proxy_id"] is None:
+                missing_proxy_count += 1
+            else:
+                missing_exchange_rate_count += 1
+
+    complete = included_count > 0 and not (missing_proxy_count or missing_exchange_rate_count)
+    return ProjectSROIRead(
+        input_cost=input_cost,
+        total_social_value=total_social_value if complete else None,
+        sroi_ratio=(total_social_value / input_cost).quantize(RATIO_QUANTUM, rounding=ROUND_HALF_UP)
+        if complete and input_cost > 0 else None,
+        included_outcome_count=included_count,
+        missing_proxy_count=missing_proxy_count,
+        missing_exchange_rate_count=missing_exchange_rate_count,
+    )
 
 
 @router.get(
@@ -688,12 +1013,13 @@ def save_stakeholder_sroi(
         for proxy in db.query(FinancialProxy).filter(
             FinancialProxy.proxy_id.in_(proxy_ids) if proxy_ids else False,
             FinancialProxy.is_delete.is_(False),
+            FinancialProxy.review_status == "approved",
         ).all()
     }
     if set(proxies) != proxy_ids:
-        raise APIException(400, "30013", "財務代理變數不存在或已刪除")
-
-    stakeholder.sroi_discount_rate = data.discount_rate
+        raise APIException(400, "30013", "只能選擇已通過審核的財務代理變數")
+    for month in {item.exchange_rate_month for item in data.outcomes if item.exchange_rate_month is not None}:
+        month_end_date(month)
 
     existing_valuations = {
         valuation.outcome_id: valuation
@@ -714,16 +1040,16 @@ def save_stakeholder_sroi(
             db.add(valuation)
             db.flush()
         proxy = proxies.get(item.financial_proxy_id)
-        valuation.quantity = item.quantity
         valuation.financial_proxy_id = item.financial_proxy_id
-        # 保留一份儲存當下的金額快照；讀取計算時以代理變數資料庫的現值為準。
+        if "exchange_rate_month" in item.model_fields_set:
+            valuation.exchange_rate_month = item.exchange_rate_month
+        # 保留儲存時的原幣金額；計算時以代理變數現值及最新匯率換算。
         valuation.financial_proxy_value = proxy.value if proxy else Decimal("0")
         valuation.deadweight_rate = item.deadweight_rate
         valuation.attribution_rate = item.attribution_rate
         valuation.displacement_rate = item.displacement_rate
         valuation.duration_years = item.duration_years
         valuation.dropoff_rate = item.dropoff_rate
-        valuation.is_included = item.is_included
         valuation.is_delete = False
         retained_valuation_ids.add(valuation.valuation_id)
     for valuation in existing_valuations.values():
@@ -773,10 +1099,13 @@ def update_project(
         stakeholder_items = [StakeholderUpdateInput(**item) for item in stakeholders]
         _validate_stakeholder_forms(db, stakeholder_items, project_id)
         saved_stakeholders = _replace_stakeholders(project, stakeholder_items)
+        new_stakeholders = [item for item in saved_stakeholders if item.stakeholder_id is None]
         promotions = _apply_interview_files(db, project, stakeholder_items, saved_stakeholders)
         _apply_stakeholder_children(project, stakeholder_items, saved_stakeholders)
         # 移除利害關係人也會刪掉他的成果與成本，所以只要送了利害關係人就重新整理
         db.flush()
+        for stakeholder in new_stakeholders:
+            add_stakeholder_form(project, stakeholder, user_id)
         _sync_actual_input_cost(db, project)
     db.flush()
 
@@ -813,9 +1142,100 @@ def delete_project(
     db: Session = Depends(get_db),
     payload: dict = Depends(return_payload),
 ) -> None:
-    project = _get_project(db, project_id, _user_id(payload), GroupRole.LEADER)
+    project = _get_project(db, project_id, _user_id(payload), GroupRole.LEADER, allow_closed=True)
     project.is_delete = True
     db.commit()
+
+
+@router.post("/{project_id}/make-public", response_model=ProjectRead)
+def make_project_public(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """群組草稿公開給組員：草稿只有建立者看得到，所以只有建立者能做；公開後不能改回草稿。"""
+    user_id = _user_id(payload)
+    # 別人的草稿在 get_project_role 會是 None，這裡直接回 404
+    project = _get_project(db, project_id, user_id, GroupRole.EDITOR)
+    if project.is_personal:
+        raise APIException(400, "30022", "個人專案沒有草稿模式")
+    if not project.is_draft:
+        raise APIException(409, "30023", "專案已經公開")
+    project.is_draft = False
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
+
+
+@router.post("/{project_id}/close", response_model=ProjectRead)
+def close_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """結案：只有組長能做，且專案期間結束後（待結案）才能結案；結案後無法復原。"""
+    user_id = _user_id(payload)
+    project = _get_project(db, project_id, user_id, GroupRole.LEADER, allow_closed=True)
+    if project.closed_at is not None:
+        raise APIException(409, "30014", "專案已結案")
+    if project.is_draft:
+        raise APIException(409, "30021", "草稿需要先公開給群組才能結案")
+    if datetime.now(timezone.utc) <= _as_aware(project.end):
+        raise APIException(400, "30015", "專案期間尚未結束，還不能結案")
+    project.closed_at = datetime.now(timezone.utc)
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
+
+
+@router.post("/{project_id}/publish", response_model=ProjectRead)
+def publish_project(
+    project_id: str,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """發布至資料庫：只有組長能做，且必須先結案；送出後進入審核，資料庫編輯者同意後才會發布。"""
+    user_id = _user_id(payload)
+    project = _get_project(db, project_id, user_id, GroupRole.LEADER, allow_closed=True)
+    if project.closed_at is None:
+        raise APIException(400, "30016", "專案結案後才能發布至資料庫")
+    if project.published_at is not None:
+        raise APIException(409, "30017", "專案已發布至資料庫")
+    if project.review_requested_at is not None:
+        raise APIException(409, "30018", "專案審核中")
+    project.review_requested_at = datetime.now(timezone.utc)
+    db.commit()
+    return _get_project(db, project_id, user_id, GroupRole.VIEWER)
+
+
+@router.post("/{project_id}/review", response_model=ProjectRead)
+def review_project(
+    project_id: str,
+    data: ProjectReviewDecision,
+    db: Session = Depends(get_db),
+    payload: dict = Depends(return_payload),
+) -> Project:
+    """審核專案：只有資料庫編輯者、管理員能做。同意則發布至資料庫；不同意則退回已結案，不會出現在共用資料庫。"""
+    user_id = _user_id(payload)
+    _require_reviewer(db, user_id)
+    project = _project_query(db).filter(
+        Project.project_id == project_id,
+        Project.is_delete.is_(False),
+    ).first()
+    if project is None:
+        raise APIException(404, "30001", "Project not found")
+    if not is_project_reviewing(project):
+        raise APIException(409, "30020", "專案不在審核中")
+    if data.approved:
+        project.published_at = datetime.now(timezone.utc)
+    else:
+        project.review_requested_at = None
+    db.commit()
+
+    # 不同意後資料庫編輯者就看不到這個專案了，所以不走 _get_project 的權限檢查
+    project = _project_query(db).filter(Project.project_id == project_id).first()
+    member_role = get_member_project_role(db, project, user_id)
+    project.is_member = member_role is not None
+    project.my_role = (member_role or GroupRole.VIEWER).value
+    return project
 
 
 @router.post(

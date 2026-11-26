@@ -44,18 +44,30 @@ class ResponseStatus(Enum):
 
 # email 欄位只存 @ 前面的部分，寄信時才補上網域
 EMAIL_DOMAIN = "@nccu.edu.tw"
+ACCOUNT_NCCU = "nccu"
+ACCOUNT_EXTERNAL = "external"
 
 
 class Account(Base):
     __tablename__ = "accounts"
 
-    campus_id = Column(String(36)) # 教職員編號、學號
+    # 學號：email 前綴是 9 碼數字才是學生，學號就是前綴；其他帳號是 None
+    campus_id = Column(String(36))
     user_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    # 政大帳號只存 email 前綴；校外帳號存完整 email（小寫）
     email = Column(String(255), nullable=False)
+    # nccu 政大師生（自行註冊）；external 校外人士（管理員邀請）
+    account_type = Column(String(20), nullable=False, default=ACCOUNT_NCCU, server_default=ACCOUNT_NCCU)
+    organization = Column(String(255), nullable=True)  # 校外人士的所屬單位
+    valid_until = Column(DateTime(timezone=True), nullable=True)  # 校外帳號到期時間；到期後不能登入，管理員可延長
     hash_password = Column(String(255), nullable=False)
     name = Column(String(20), nullable=False)
     role = Column(SQLEnum(Role), nullable=False)
+    # 學生下次要做在學驗證的民國年：當年 9/1 起要驗證、10/1 截止；通過後加 1。非學生是 None
+    verify_due_year = Column(Integer, nullable=True)
     is_delete = Column(Boolean, nullable=False, default=False)
+    # 刪除原因；enrollment_expired 表示沒在期限內完成在學驗證，登入時顯示停用訊息
+    delete_reason = Column(String(30), nullable=True)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
@@ -82,15 +94,24 @@ class Account(Base):
         # 舊資料可能已經是完整 email，就不再補網域
         return self.email if "@" in self.email else self.email + EMAIL_DOMAIN
 
-    @staticmethod
-    def campus_id_taken(db, campus_id: str, exclude_user_id: Optional[str] = None) -> bool:
-        query = db.query(Account).filter(
-            Account.campus_id == campus_id,
-            Account.is_delete == False,
-        )
-        if exclude_user_id is not None:
-            query = query.filter(Account.user_id != exclude_user_id)
-        return query.first() is not None
+
+class ExternalInvitation(Base):
+    """校外人士邀請：管理員送出後寄信，對方點連結設定姓名與密碼才建立帳號"""
+    __tablename__ = "external_invitations"
+
+    invitation_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    email = Column(String(255), nullable=False, index=True)  # 完整 email（小寫）
+    organization = Column(String(255), nullable=False)
+    valid_years = Column(Integer, nullable=False)  # 帳號使用年限，從完成註冊開始算
+    invited_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=False)
+    # 寫在連結 token 裡；重寄時更換，舊連結就失效
+    token_nonce = Column(String(64), nullable=False)
+    expires_at = Column(DateTime(timezone=True), nullable=False)  # 連結到期時間（7 天）
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    accepted_user_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=True)
+    is_delete = Column(Boolean, nullable=False, default=False)  # 取消，或被新的邀請取代
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
 
 class VerifiedCode(Base):
@@ -99,6 +120,8 @@ class VerifiedCode(Base):
     uuid = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     email = Column(String(255), nullable=False, index=True)
     code_hash = Column(String(64), nullable=False)
+    # 用途：register 註冊、reset_password 忘記密碼；兩種驗證碼不能互用
+    purpose = Column(String(20), nullable=False, default="register", server_default="register")
     expires_at = Column(DateTime(timezone=True), nullable=False)
     attempts = Column(Integer, nullable=False, default=0)  # 輸入錯誤的次數
     is_verified = Column(Boolean, nullable=False, default=False)
@@ -107,18 +130,34 @@ class VerifiedCode(Base):
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
 
-class VerifiedInProgress(Base):
-    __tablename__ = "verified_in_progress"
+class EnrollmentStatus:
+    PENDING = "pending"     # 已上傳，等管理員審核
+    APPROVED = "approved"   # 通過，帳號延長一年
+    REJECTED = "rejected"   # 退回，學生可在截止前重新上傳
 
-    # 學號變更申請
-    uuid  = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
-    campus_id = Column(String(36), nullable=False) # 教職員編號、學號
-    user_id = Column(String(36), nullable=False)
-    is_delete = Column(Boolean, nullable=False, default=False)
+
+class EnrollmentVerification(Base):
+    """學生的在學證明；每年 9 月需要驗證時上傳，由管理員審核"""
+    __tablename__ = "enrollment_verifications"
+
+    verification_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False, index=True)
+    due_year = Column(Integer, nullable=False)  # 這份證明對應的驗證年（民國）
+    stored_name = Column(String(255), nullable=False)
+    original_name = Column(String(255), nullable=False)
+    content_type = Column(String(100), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    status = Column(String(20), nullable=False, default=EnrollmentStatus.PENDING)
+    reason = Column(Text, nullable=True)  # 退回原因
+    reviewed_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    is_delete = Column(Boolean, nullable=False, default=False)  # 審核中重新上傳時，舊的作廢
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
 
-    
+    user = relationship("Account", foreign_keys=[user_id])
+
+
 class Group(Base):
     __tablename__ = "groups"
 
@@ -163,16 +202,30 @@ class GroupAccount(Base):
 
 class Form(Base):
     __tablename__ = "forms"
+    __table_args__ = (
+        Index(
+            "uq_forms_active_stakeholder", "stakeholder_id", unique=True,
+            postgresql_where=text("stakeholder_id IS NOT NULL AND is_delete = false"),
+        ),
+    )
 
     form_id = Column(String(36), primary_key=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
     public_token = Column(String(32), unique=True, index=True)
     author_id = Column(String(36), ForeignKey("accounts.user_id"), nullable=False)
     project_id = Column(String(36), ForeignKey("projects.project_id", ondelete="CASCADE"), nullable=True, index=True)
+    stakeholder_id = Column(String(36), ForeignKey(
+        "project_stakeholders.stakeholder_id", ondelete="SET NULL", name="fk_forms_stakeholder_id"
+    ), nullable=True)
     title = Column(String(255))
     content = Column(Text)
     status = Column(SQLEnum(FormStatus), nullable=False, default=FormStatus.DRAFT)
     shuffle_outcome_questions = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     outcome_sync_index = Column(Integer, nullable=False, default=0, server_default="0")
+    published_consent_id = Column(
+        String(36),
+        ForeignKey("form_consents.consent_id", ondelete="SET NULL"),
+        nullable=True,
+    )
     result_id_list = Column(ARRAY(String(255)))
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -184,6 +237,16 @@ class Form(Base):
     answers = relationship("Answer", back_populates="form")
 
     responses = relationship("FormResponse", back_populates="form")
+    consent_versions = relationship(
+        "FormConsent",
+        back_populates="form",
+        foreign_keys="FormConsent.form_id",
+    )
+    published_consent = relationship(
+        "FormConsent",
+        foreign_keys=[published_consent_id],
+        post_update=True,
+    )
     project = relationship("Project", back_populates="forms", foreign_keys=[project_id])
     pre_test_stakeholders = relationship(
         "ProjectStakeholder",
@@ -195,6 +258,67 @@ class Form(Base):
         back_populates="post_form",
         foreign_keys="ProjectStakeholder.post_form_id",
     )
+
+    @property
+    def draft_consent(self):
+        return next(
+            (
+                consent
+                for consent in self.consent_versions
+                if not consent.is_published and not consent.is_delete
+            ),
+            None,
+        )
+
+
+class FormConsent(Base):
+    __tablename__ = "form_consents"
+    __table_args__ = (
+        UniqueConstraint("form_id", "version", name="uq_form_consent_version"),
+        Index(
+            "uq_form_consent_draft",
+            "form_id",
+            unique=True,
+            postgresql_where=text("is_published = false AND is_delete = false"),
+        ),
+    )
+
+    consent_id = Column(
+        String(36),
+        primary_key=True,
+        index=True,
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+    )
+    form_id = Column(
+        String(36),
+        ForeignKey("forms.form_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version = Column(Integer, nullable=False, default=0)
+    is_published = Column(Boolean, nullable=False, default=False, server_default="false")
+    title = Column(String(255), nullable=False)
+    organization_name = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False)
+    secondary_use_description = Column(Text, nullable=False, default="")
+    withdrawal_method = Column(Text, nullable=False, default="")
+    contact_name = Column(String(255), nullable=False, default="")
+    contact_email = Column(String(255), nullable=False, default="")
+    contact_phone = Column(String(100), nullable=False, default="")
+    requires_guardian = Column(Boolean, nullable=False, default=True, server_default="true")
+    secondary_use_enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    published_at = Column(DateTime(timezone=True))
+    is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
+    create_time = Column(DateTime(timezone=True), server_default=func.now())
+    update_time = Column(DateTime(timezone=True), onupdate=func.now())
+
+    form = relationship(
+        "Form",
+        back_populates="consent_versions",
+        foreign_keys=[form_id],
+    )
+    records = relationship("ConsentRecord", back_populates="consent")
 
 
 class Project(Base):
@@ -220,6 +344,12 @@ class Project(Base):
     sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
     outcome_sync_sequence = Column(Integer, nullable=False, default=0, server_default="0")
     status = Column(String(20), nullable=False, default="draft")
+    # 群組專案的草稿：只有建立者看得到，公開後組員才看得到；公開是單向的。個人專案一律 False
+    is_draft = Column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # 結案後專案內容不能再修改；結案後送出發布會先進入審核，資料庫編輯者同意後才算發布
+    closed_at = Column(DateTime(timezone=True), nullable=True)
+    review_requested_at = Column(DateTime(timezone=True), nullable=True)  # 送審時間；不同意時清回 null
+    published_at = Column(DateTime(timezone=True), nullable=True)
     is_delete = Column(Boolean, nullable=False, default=False)
     create_time = Column(DateTime(timezone=True), server_default=func.now())
     update_time = Column(DateTime(timezone=True), onupdate=func.now())
@@ -296,6 +426,8 @@ class ProjectStakeholder(Base):
     pre_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 前測表單
     post_form_id = Column(String(36), ForeignKey("forms.form_id", ondelete="SET NULL"), nullable=True, index=True)  # 後測表單
     sroi_discount_rate = Column(Numeric(5, 4), nullable=False, default=0.035, server_default="0.035")
+    # 舊的整份 SROI 匯率年月，保留原始設定供資料遷移。
+    sroi_exchange_rate_month = Column(String(7), nullable=True)
     position = Column(Integer, nullable=False, default=0)
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     create_time = Column(DateTime(timezone=True), server_default=func.now())
@@ -371,7 +503,8 @@ class ProjectOutcomeValuation(Base):
         index=True,
     )
     quantity = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
-    financial_proxy_value = Column(Numeric(14, 2), nullable=False, default=0, server_default="0")
+    financial_proxy_value = Column(Numeric(18, 4), nullable=False, default=0, server_default="0")
+    exchange_rate_month = Column(String(7), nullable=True)
     deadweight_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
     attribution_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
     displacement_rate = Column(Numeric(5, 4), nullable=False, default=0, server_default="0")
@@ -532,6 +665,48 @@ class FormResponse(Base):
     is_delete = Column(Boolean, nullable=False, default=False, server_default="false")
     form = relationship("Form",back_populates="responses")
     answers = relationship("Answer",back_populates="response")
+    consent_record = relationship(
+        "ConsentRecord",
+        back_populates="response",
+        uselist=False,
+    )
+
+
+class ConsentRecord(Base):
+    __tablename__ = "consent_records"
+
+    consent_record_id = Column(
+        String(36),
+        primary_key=True,
+        index=True,
+        nullable=False,
+        default=lambda: str(uuid.uuid4()),
+    )
+    response_id = Column(
+        String(36),
+        ForeignKey("form_responses.response_id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    consent_id = Column(
+        String(36),
+        ForeignKey("form_consents.consent_id"),
+        nullable=False,
+        index=True,
+    )
+    respondent_email = Column(String(255), nullable=False)
+    participant_name = Column(String(255), nullable=False)
+    participant_agreed = Column(Boolean, nullable=False)
+    secondary_use_agreed = Column(Boolean, nullable=False, default=False, server_default="false")
+    is_adult = Column(Boolean, nullable=False)
+    guardian_name = Column(String(255))
+    guardian_relationship = Column(String(100))
+    guardian_agreed = Column(Boolean)
+    consented_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    response = relationship("FormResponse", back_populates="consent_record")
+    consent = relationship("FormConsent", back_populates="records")
 
 class Answer(Base):
     __tablename__ = "answers"
@@ -568,6 +743,12 @@ class AnswerChoice(Base):
 
 class FinancialProxy(Base):
     __tablename__ = "financial_proxies"
+    __table_args__ = (
+        CheckConstraint(
+            "review_status IN ('pending', 'approved', 'rejected')",
+            name="ck_financial_proxy_review_status",
+        ),
+    )
 
     proxy_id = Column(
         String(36),
@@ -577,8 +758,12 @@ class FinancialProxy(Base):
 
     name = Column(String(255), nullable=False)
     value = Column(Numeric(18, 4), nullable=False)
+    currency = Column(String(3), nullable=False, default="TWD", server_default="TWD")
     unit = Column(String(50), nullable=False, default="元", server_default="元")
     note = Column(Text, nullable=False, default="")
+    review_status = Column(String(10), nullable=False, default="pending", server_default="pending")
+    reviewed_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=True)
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
 
     created_by = Column(
         String(36),
