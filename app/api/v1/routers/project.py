@@ -36,7 +36,6 @@ from app.core.permissions import (
     has_role,
     can_review_database,
     is_admin,
-    can_review_projects,
     is_project_reviewing,
     require_project_role,
 )
