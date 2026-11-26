@@ -759,7 +759,6 @@ class FinancialProxy(Base):
     name = Column(String(255), nullable=False)
     value = Column(Numeric(18, 4), nullable=False)
     currency = Column(String(3), nullable=False, default="TWD", server_default="TWD")
-    unit = Column(String(50), nullable=False, default="元", server_default="元")
     note = Column(Text, nullable=False, default="")
     review_status = Column(String(10), nullable=False, default="pending", server_default="pending")
     reviewed_by = Column(String(36), ForeignKey("accounts.user_id"), nullable=True)
