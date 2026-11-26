@@ -16,7 +16,6 @@ class FinancialProxyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     value: Decimal = Field(max_digits=18, decimal_places=4)
     currency: ProxyCurrency = "TWD"
-    unit: str = Field(default="元", min_length=1, max_length=50)
     note: str = ""
 
 
